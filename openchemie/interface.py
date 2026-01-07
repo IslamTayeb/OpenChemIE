@@ -1,6 +1,9 @@
 import torch
 import re
+import time
+import warnings
 from functools import lru_cache
+from concurrent.futures import ThreadPoolExecutor
 import layoutparser as lp
 import pdf2image
 from PIL import Image
@@ -11,6 +14,12 @@ from chemiener import ChemNER
 from .chemrxnextractor import ChemRxnExtractor
 from .tableextractor import TableExtractor
 from .utils import *
+from .timing import time_function_call, log_phase, log_summary, create_timed_wrapper, reset_timing_data, get_timing_data, _get_timing_data
+
+# Suppress harmless checkpoint warning during inference
+# This warning appears because checkpointing expects gradients, but during inference
+# we use torch.no_grad() which is correct - we don't need gradients for inference
+warnings.filterwarnings('ignore', message='.*None of the inputs have requires_grad=True.*')
 
 class OpenChemIE:
     def __init__(self, device=None):
@@ -48,7 +57,7 @@ class OpenChemIE:
         if ckpt_path is None:
             ckpt_path = hf_hub_download("yujieq/MolScribe", "swin_base_char_aux_1m.pth")
         self._molscribe = MolScribe(ckpt_path, device=self.device)
-    
+
 
     @property
     def rxnscribe(self):
@@ -66,7 +75,7 @@ class OpenChemIE:
         if ckpt_path is None:
             ckpt_path = hf_hub_download("yujieq/RxnScribe", "pix2seq_reaction_full.ckpt")
         self._rxnscribe = RxnScribe(ckpt_path, device=self.device)
-    
+
 
     @property
     def pdfparser(self):
@@ -83,7 +92,7 @@ class OpenChemIE:
         """
         config_path = "lp://efficientdet/PubLayNet/tf_efficientdet_d1"
         self._pdfparser = lp.AutoLayoutModel(config_path, model_path=ckpt_path, device=self.device.type)
-    
+
 
     @property
     def moldet(self):
@@ -101,7 +110,7 @@ class OpenChemIE:
         if ckpt_path is None:
             ckpt_path = hf_hub_download("Ozymandias314/MolDetectCkpt", "best_hf.ckpt")
         self._moldet = MolDetect(ckpt_path, device=self.device)
-        
+
 
     @property
     def coref(self):
@@ -156,7 +165,7 @@ class OpenChemIE:
             ckpt_path = hf_hub_download("Ozymandias314/ChemNERckpt", "best.ckpt")
         self._chemner = ChemNER(ckpt_path, device=self.device)
 
-    
+
     @property
     def tableextractor(self):
         return TableExtractor()
@@ -199,7 +208,7 @@ class OpenChemIE:
         table_ext.set_output_image(output_image)
 
         table_ext.set_output_bbox(output_bbox)
-        
+
         return table_ext.extract_all_tables_and_figures(pages, self.pdfparser, content='figures')
 
     def extract_tables_from_pdf(self, pdf, num_pages=None, output_bbox=False, output_image=True):
@@ -239,7 +248,7 @@ class OpenChemIE:
         table_ext.set_output_image(output_image)
 
         table_ext.set_output_bbox(output_bbox)
-        
+
         return table_ext.extract_all_tables_and_figures(pages, self.pdfparser, content='tables')
 
     def extract_molecules_from_figures_in_pdf(self, pdf, batch_size=16, num_pages=None):
@@ -269,13 +278,36 @@ class OpenChemIE:
                 # more figures
             ]
         """
-        figures = self.extract_figures_from_pdf(pdf, num_pages=num_pages, output_bbox=True)
+        reset_timing_data()
+        total_start = time.time()
+
+        figures = time_function_call(
+            self.extract_figures_from_pdf,
+            pdf, num_pages=num_pages, output_bbox=True,
+            module_name="extract_figures_from_pdf",
+            silent=True
+        )
         images = [figure['figure']['image'] for figure in figures]
-        results = self.extract_molecules_from_figures(images, batch_size=batch_size)
+        results = time_function_call(
+            self.extract_molecules_from_figures,
+            images, batch_size,
+            module_name="extract_molecules_from_figures",
+            silent=True
+        )
         for figure, result in zip(figures, results):
             result['page'] = figure['page']
+
+        total_time = time.time() - total_start
+        timing_data = get_timing_data()
+        timing_data['total_time'] = total_time
+        timing_data['num_figures'] = len(figures)
+
+        # Add timing to first result if available
+        if results:
+            results[0]['_timing'] = timing_data
+
         return results
-    
+
     def extract_molecule_bboxes_from_figures(self, figures, batch_size=16):
         """
         Return bounding boxes of molecules in images
@@ -346,9 +378,9 @@ class OpenChemIE:
                 {
                     'bboxes': [
                         {   # first bbox
-                            'category': '[Sup]', 
-                            'bbox': (0.0050025012506253125, 0.38273870663142223, 0.9934967483741871, 0.9450094869920168), 
-                            'category_id': 4, 
+                            'category': '[Sup]',
+                            'bbox': (0.0050025012506253125, 0.38273870663142223, 0.9934967483741871, 0.9450094869920168),
+                            'category_id': 4,
                             'score': -0.07593922317028046
                         },
                         # More bounding boxes
@@ -382,9 +414,9 @@ class OpenChemIE:
                 {
                     'bboxes': [
                         {   # first bbox
-                            'category': '[Sup]', 
-                            'bbox': (0.0050025012506253125, 0.38273870663142223, 0.9934967483741871, 0.9450094869920168), 
-                            'category_id': 4, 
+                            'category': '[Sup]',
+                            'bbox': (0.0050025012506253125, 0.38273870663142223, 0.9934967483741871, 0.9450094869920168),
+                            'category_id': 4,
                             'score': -0.07593922317028046
                         },
                         # More bounding boxes
@@ -400,7 +432,7 @@ class OpenChemIE:
         """
         figures = [convert_to_pil(figure) for figure in figures]
         return self.coref.predict_images(figures, batch_size=batch_size, coref=True, molscribe = molscribe, ocr = ocr)
-    
+
     def extract_reactions_from_figures_in_pdf(self, pdf, batch_size=16, num_pages=None, molscribe=True, ocr=True):
         """
         Get reaction information from figures in pdf
@@ -447,11 +479,34 @@ class OpenChemIE:
                 # more figures
             ]
         """
-        figures = self.extract_figures_from_pdf(pdf, num_pages=num_pages, output_bbox=True)
+        reset_timing_data()
+        total_start = time.time()
+
+        figures = time_function_call(
+            self.extract_figures_from_pdf,
+            pdf, num_pages=num_pages, output_bbox=True,
+            module_name="extract_figures_from_pdf",
+            silent=True
+        )
         images = [figure['figure']['image'] for figure in figures]
-        results = self.extract_reactions_from_figures(images, batch_size=batch_size, molscribe=molscribe, ocr=ocr)
+        results = time_function_call(
+            self.extract_reactions_from_figures,
+            images, batch_size, molscribe, ocr,
+            module_name="extract_reactions_from_figures",
+            silent=True
+        )
         for figure, result in zip(figures, results):
             result['page'] = figure['page']
+
+        total_time = time.time() - total_start
+        timing_data = get_timing_data()
+        timing_data['total_time'] = total_time
+        timing_data['num_figures'] = len(figures)
+
+        # Add timing to first result if available
+        if results:
+            results[0]['_timing'] = timing_data
+
         return results
 
     def extract_reactions_from_figures(self, figures, batch_size=16, molscribe=True, ocr=True):
@@ -736,18 +791,109 @@ class OpenChemIE:
             }
 
         """
-        figures = self.extract_figures_from_pdf(pdf, num_pages=num_pages, output_bbox=True)
+        # Reset timing data for this run
+        reset_timing_data()
+        total_start = time.time()
+
+        # Phase 1: Extract figures first (needed for later steps)
+        log_phase("Phase 1: Extract figures", silent=True)
+        figures = time_function_call(
+            self.extract_figures_from_pdf,
+            pdf, num_pages=num_pages, output_bbox=True,
+            module_name="extract_figures_from_pdf",
+            silent=True
+        )
         images = [figure['figure']['image'] for figure in figures]
-        results = self.extract_reactions_from_figures(images, batch_size=batch_size, molscribe=True, ocr=True)
-        table_expanded_results = process_tables(figures, results, self.molscribe, batch_size=batch_size)
-        text_results = self.extract_reactions_from_text_in_pdf(pdf, num_pages=num_pages)
-        results_coref = self.extract_molecule_corefs_from_figures_in_pdf(pdf, num_pages=num_pages)
-        figure_results = replace_rgroups_in_figure(figures, table_expanded_results, results_coref, self.molscribe, batch_size=batch_size)
-        table_expanded_results = expand_reactions_with_backout(figure_results, results_coref, self.molscribe)
-        coref_expanded_results = associate_corefs(text_results, results_coref)
+
+        # Phase 2: Launch independent operations in parallel
+        log_phase("Phase 2: Parallel operations", silent=True)
+        # These can run concurrently since they don't depend on each other:
+        # - extract_reactions_from_figures: processes figure images
+        # - extract_reactions_from_text_in_pdf: processes PDF text (independent)
+        # - extract_molecule_corefs_from_figures_in_pdf: processes figures again (independent)
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            # Create timed wrappers for each function (silent to avoid spam)
+            timed_extract_reactions = create_timed_wrapper(
+                self.extract_reactions_from_figures,
+                "extract_reactions_from_figures",
+                silent=True
+            )
+            timed_extract_text = create_timed_wrapper(
+                self.extract_reactions_from_text_in_pdf,
+                "extract_reactions_from_text_in_pdf",
+                silent=True
+            )
+            timed_extract_coref = create_timed_wrapper(
+                self.extract_molecule_corefs_from_figures_in_pdf,
+                "extract_molecule_corefs_from_figures_in_pdf",
+                silent=True
+            )
+
+            future_reactions = executor.submit(
+                timed_extract_reactions,
+                images, batch_size, True, True
+            )
+            future_text = executor.submit(
+                timed_extract_text,
+                pdf, num_pages
+            )
+            future_coref = executor.submit(
+                timed_extract_coref,
+                pdf, batch_size, num_pages
+            )
+
+            # Wait for all parallel operations to complete and collect timing
+            reactions_result, reactions_timing = future_reactions.result()
+            text_result, text_timing = future_text.result()
+            coref_result, coref_timing = future_coref.result()
+
+            # Store timing data from parallel operations
+            timing_data = _get_timing_data()
+            timing_data['modules'].append(reactions_timing)
+            timing_data['modules'].append(text_timing)
+            timing_data['modules'].append(coref_timing)
+
+            results = reactions_result
+            text_results = text_result
+            results_coref = coref_result
+
+        # Phase 3: Sequential post-processing (dependencies must be resolved)
+        log_phase("Phase 3: Post-processing", silent=True)
+        table_expanded_results = time_function_call(
+            process_tables,
+            figures, results, self.molscribe, batch_size,
+            module_name="process_tables",
+            silent=True
+        )
+        figure_results = time_function_call(
+            replace_rgroups_in_figure,
+            figures, table_expanded_results, results_coref, self.molscribe, batch_size,
+            module_name="replace_rgroups_in_figure",
+            silent=True
+        )
+        table_expanded_results = time_function_call(
+            expand_reactions_with_backout,
+            figure_results, results_coref, self.molscribe,
+            module_name="expand_reactions_with_backout",
+            silent=True
+        )
+        coref_expanded_results = time_function_call(
+            associate_corefs,
+            text_results, results_coref,
+            module_name="associate_corefs",
+            silent=True
+        )
+
+        total_time = time.time() - total_start
+        log_summary(total_time, num_figures=len(figures), num_pages=num_pages, silent=True)
+
+        # Get timing data for return
+        timing_data = get_timing_data()
+
         return {
             'figures': table_expanded_results,
             'text': coref_expanded_results,
+            '_timing': timing_data  # Include timing data in return
         }
 
 if __name__=="__main__":
