@@ -357,12 +357,54 @@ class OpenChemIE:
                 # more figures
             ]
         """
-        bboxes = self.extract_molecule_bboxes_from_figures(figures, batch_size=batch_size)
-        figures = [convert_to_cv2(figure) for figure in figures]
-        results, cropped_images, refs = clean_bbox_output(figures, bboxes)
-        mol_info = self.molscribe.predict_images(cropped_images, batch_size=batch_size)
+        from .timing import time_module, _get_timing_data, reset_timing_data
+
+        reset_timing_data()
+        total_start = time.time()
+
+        with time_module("moldet.predict_images", silent=True):
+            bboxes = self.extract_molecule_bboxes_from_figures(figures, batch_size=batch_size)
+
+        # Capture MolDetect's detailed timing
+        moldet_timing = None
+        if hasattr(self.moldet, 'get_last_timing'):
+            moldet_timing = self.moldet.get_last_timing()
+
+        with time_module("convert_to_cv2", silent=True):
+            figures = [convert_to_cv2(figure) for figure in figures]
+
+        with time_module("clean_bbox_output", silent=True):
+            results, cropped_images, refs = clean_bbox_output(figures, bboxes)
+
+        with time_module("molscribe.predict_images", silent=True):
+            mol_info = self.molscribe.predict_images(cropped_images, batch_size=batch_size)
+
+        # Capture MolScribe's detailed timing
+        molscribe_timing = None
+        if hasattr(self.molscribe, 'get_last_timing'):
+            molscribe_timing = self.molscribe.get_last_timing()
+
         for info, ref in zip(mol_info, refs):
             ref.update(info)
+
+        # Add timing data to results
+        timing_data = _get_timing_data()
+        timing_data['total_time'] = time.time() - total_start
+        timing_data['num_figures'] = len(results)
+        timing_data['num_molecules'] = sum(len(r.get('molecules', [])) for r in results)
+
+        # Include MolDetect's detailed timing breakdown
+        if moldet_timing:
+            timing_data['moldet_breakdown'] = moldet_timing
+
+        # Include MolScribe's detailed timing breakdown
+        if molscribe_timing:
+            timing_data['molscribe_breakdown'] = molscribe_timing
+
+        # Attach timing to first result for retrieval
+        if results:
+            results[0]['_timing'] = timing_data.copy()
+
         return results
 
     def extract_molecule_corefs_from_figures_in_pdf(self, pdf, batch_size=16, num_pages=None, molscribe = True, ocr = True):
@@ -554,15 +596,44 @@ class OpenChemIE:
             ]
 
         """
-        pil_figures = [convert_to_pil(figure) for figure in figures]
+        from .timing import time_module, _get_timing_data, reset_timing_data
+
+        reset_timing_data()
+        total_start = time.time()
+
+        with time_module("convert_to_pil", silent=True):
+            pil_figures = [convert_to_pil(figure) for figure in figures]
+
         results = []
-        reactions = self.rxnscribe.predict_images(pil_figures, batch_size=batch_size, molscribe=molscribe, ocr=ocr)
+        with time_module("rxnscribe.predict_images", silent=True):
+            reactions = self.rxnscribe.predict_images(pil_figures, batch_size=batch_size, molscribe=molscribe, ocr=ocr)
+
+        # Capture RxnScribe's detailed timing
+        rxnscribe_timing = None
+        if hasattr(self.rxnscribe, 'get_last_timing'):
+            rxnscribe_timing = self.rxnscribe.get_last_timing()
+
         for figure, rxn in zip(figures, reactions):
             data = {
                 'figure': figure,
                 'reactions': rxn,
                 }
             results.append(data)
+
+        # Add timing data to results
+        timing_data = _get_timing_data()
+        timing_data['total_time'] = time.time() - total_start
+        timing_data['num_figures'] = len(results)
+        timing_data['num_reactions'] = sum(len(r.get('reactions', [])) for r in results)
+
+        # Include RxnScribe's detailed timing breakdown
+        if rxnscribe_timing:
+            timing_data['rxnscribe_breakdown'] = rxnscribe_timing
+
+        # Attach timing to first result for retrieval
+        if results:
+            results[0]['_timing'] = timing_data.copy()
+
         return results
 
     def extract_molecules_from_text_in_pdf(self, pdf, batch_size=16, num_pages=None):

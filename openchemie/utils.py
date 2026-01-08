@@ -270,6 +270,9 @@ def get_sites(tar, ref, ref_site = False):
 
 def get_atom_mapping(prod_mol, prod_smiles, r_sites_reversed = None):
     # returns prod_mol_to_query which is the mapping of atom indices in prod_mol to the atom indices of the molecule represented by prod_smiles
+    # Handle None mol (can happen if molblock was empty due to invalid molecule)
+    if prod_mol is None:
+        return {}, None
     prod_template_intermediate = Chem.MolToSmiles(prod_mol)
     prod_template = prod_smiles
 
@@ -557,6 +560,10 @@ def backout(results, coref_results, molscribe):
         prod_smiles = prod
         prod_mol = Chem.MolFromMolBlock(results[0]['reactions'][0]['products'][0]['molfile'])
         
+        # Skip R-group expansion if molblock was invalid/empty
+        if prod_mol is None:
+            return toreturn
+        
         # identify the atom indices of the R groups in the product tempalte
         h_counter = 0
         r_sites = {}
@@ -618,7 +625,10 @@ def backout(results, coref_results, molscribe):
                         reactant_information[idx].append([sym, -1, -1])
                     else: 
                         has_r = True
-                        reactant_mols[-1] = Chem.MolFromMolBlock(reactant['molfile'])
+                        mol_from_block = Chem.MolFromMolBlock(reactant['molfile'])
+                        if mol_from_block is None:
+                            continue  # Skip if molblock was invalid/empty
+                        reactant_mols[-1] = mol_from_block
                         reactant_information[idx].append([sym, a_idx-h_counter, [i.GetIdx() for i in reactant_mols[-1].GetAtomWithIdx(a_idx-h_counter).GetNeighbors()][0]])
                         r_sites_reactant[sym] = a_idx-h_counter
                 elif sym == '[1*]' and '[7*]' in r_sites:
@@ -626,7 +636,10 @@ def backout(results, coref_results, molscribe):
                         reactant_information[idx].append(['[7*]', -1, -1])
                     else: 
                         has_r = True
-                        reactant_mols[-1] = Chem.MolFromMolBlock(reactant['molfile'])
+                        mol_from_block = Chem.MolFromMolBlock(reactant['molfile'])
+                        if mol_from_block is None:
+                            continue  # Skip if molblock was invalid/empty
+                        reactant_mols[-1] = mol_from_block
                         reactant_information[idx].append(['[7*]', a_idx-h_counter, [i.GetIdx() for i in reactant_mols[-1].GetAtomWithIdx(a_idx-h_counter).GetNeighbors()][0]])
                         r_sites_reactant['[7*]'] = a_idx-h_counter
                 elif sym == '[7*]' and '[1*]' in r_sites:
@@ -634,7 +647,10 @@ def backout(results, coref_results, molscribe):
                         reactant_information[idx].append(['[1*]', -1, -1])
                     else: 
                         has_r = True
-                        reactant_mols[-1] = Chem.MolFromMolBlock(reactant['molfile'])
+                        mol_from_block = Chem.MolFromMolBlock(reactant['molfile'])
+                        if mol_from_block is None:
+                            continue  # Skip if molblock was invalid/empty
+                        reactant_mols[-1] = mol_from_block
                         reactant_information[idx].append(['[1*]', a_idx-h_counter, [i.GetIdx() for i in reactant_mols[-1].GetAtomWithIdx(a_idx-h_counter).GetNeighbors()][0]])
                         r_sites_reactant['[1*]'] = a_idx-h_counter
 
