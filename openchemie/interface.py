@@ -796,10 +796,20 @@ class OpenChemIE:
         figures = self.extract_figures_from_pdf(pdf, num_pages=num_pages, output_bbox=True)
         images = [figure['figure']['image'] for figure in figures]
         results = self.extract_reactions_from_figures(images, batch_size=batch_size, molscribe=molscribe, ocr=ocr)
+        
+        # Reset R-group timing before R-group processing
+        reset_rgroup_timing()
+        
         results = process_tables(figures, results, self.molscribe, batch_size=batch_size)
         results_coref = self.extract_molecule_corefs_from_figures_in_pdf(pdf, num_pages=num_pages)
         results = replace_rgroups_in_figure(figures, results, results_coref, self.molscribe, batch_size=batch_size)
         results = expand_reactions_with_backout(results, results_coref, self.molscribe)
+        
+        # Capture R-group timing and attach to results
+        rgroup_timing = get_rgroup_timing()
+        if rgroup_timing and rgroup_timing.get('molscribe_calls') and results:
+            results[0]['_rgroup_timing'] = rgroup_timing
+        
         return results
 
     def extract_reactions_from_pdf(self, pdf, num_pages=None, batch_size=16):
@@ -930,6 +940,10 @@ class OpenChemIE:
 
         # Phase 3: Sequential post-processing (dependencies must be resolved)
         log_phase("Phase 3: Post-processing", silent=True)
+        
+        # Reset R-group timing before R-group processing
+        reset_rgroup_timing()
+        
         table_expanded_results = time_function_call(
             process_tables,
             figures, results, self.molscribe, batch_size,
@@ -948,6 +962,10 @@ class OpenChemIE:
             module_name="expand_reactions_with_backout",
             silent=True
         )
+        
+        # Capture R-group MolScribe timing
+        rgroup_timing = get_rgroup_timing()
+        
         coref_expanded_results = time_function_call(
             associate_corefs,
             text_results, results_coref,
@@ -960,6 +978,10 @@ class OpenChemIE:
 
         # Get timing data for return
         timing_data = get_timing_data()
+        
+        # Include R-group MolScribe timing if available
+        if rgroup_timing and rgroup_timing.get('molscribe_calls'):
+            timing_data['rgroup_molscribe_timing'] = rgroup_timing
 
         return {
             'figures': table_expanded_results,

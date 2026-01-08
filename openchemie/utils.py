@@ -10,6 +10,24 @@ from rdkit.Chem.Draw import IPythonConsole
 from rdkit.Chem import AllChem
 import re
 import copy
+from threading import local
+
+# Thread-local storage for R-group timing data (to avoid conflicts in parallel execution)
+_rgroup_timing = local()
+
+def reset_rgroup_timing():
+    """Reset timing data for a new run."""
+    _rgroup_timing.data = {'molscribe_calls': [], 'total_time': 0}
+
+def get_rgroup_timing():
+    """Get current timing data."""
+    return getattr(_rgroup_timing, 'data', None)
+
+def _record_molscribe_timing(name, timing_data):
+    """Record a MolScribe timing measurement."""
+    if not hasattr(_rgroup_timing, 'data'):
+        reset_rgroup_timing()
+    _rgroup_timing.data['molscribe_calls'].append({'name': name, **timing_data})
 
 BOND_TO_INT = {
     "": 0,
@@ -187,6 +205,10 @@ def get_atoms_and_bonds(image, reaction, molscribe, batch_size=16):
             }
             results.append(to_add)
     outputs = molscribe.predict_images(cropped_images, return_atoms_bonds=True, batch_size=batch_size)
+    if hasattr(molscribe, 'get_last_timing'):
+        timing_data = molscribe.get_last_timing()
+        if timing_data:
+            _record_molscribe_timing('get_atoms_and_bonds.predict_images', timing_data)
     for mol, result in zip(outputs, results):
         for atom in mol['atoms']:
             result['chartok_coords']['coords'].append((atom['x'], atom['y']))
@@ -247,6 +269,10 @@ def get_replaced_reaction(orig_reaction, graphs, relevant_locs, mappings, molscr
 
     for graph in graph_copy:
         output = molscribe.convert_graph_to_output([graph], [graph['image']])
+        if hasattr(molscribe, 'get_last_convert_timing'):
+            timing_data = molscribe.get_last_convert_timing()
+            if timing_data:
+                _record_molscribe_timing('get_replaced_reaction.convert_graph', timing_data)
         molecule = reaction_copy[graph['key'][0]][graph['key'][1]]
         molecule['smiles'] = output[0]['smiles']
         molecule['molfile'] = output[0]['molfile']
@@ -380,6 +406,10 @@ def expand_r_group_label_helper(res, coref_smiles_to_graphs, other_prod, molscri
 
     #print(graph)
     o = molscribe.convert_graph_to_output([graph], [graph['image']])
+    if hasattr(molscribe, 'get_last_convert_timing'):
+        timing_data = molscribe.get_last_convert_timing()
+        if timing_data:
+            _record_molscribe_timing('expand_r_group_label.convert_graph', timing_data)
     return Chem.MolFromSmiles(o[0]['smiles'])
 
 def get_r_group_frags_and_substitute(other_prod_mol, query, reactant_mols, reactant_information, parsed, toreturn):
