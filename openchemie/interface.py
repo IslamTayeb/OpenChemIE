@@ -251,7 +251,7 @@ class OpenChemIE:
 
         return table_ext.extract_all_tables_and_figures(pages, self.pdfparser, content='tables')
 
-    def extract_molecules_from_figures_in_pdf(self, pdf, batch_size=16, num_pages=None):
+    def extract_molecules_from_figures_in_pdf(self, pdf, batch_size=16, num_pages=None, skip_molblock=False):
         """
         Get all molecules and their information from a pdf
         Parameters:
@@ -290,7 +290,7 @@ class OpenChemIE:
         images = [figure['figure']['image'] for figure in figures]
         results = time_function_call(
             self.extract_molecules_from_figures,
-            images, batch_size,
+            images, batch_size, skip_molblock,
             module_name="extract_molecules_from_figures",
             silent=True
         )
@@ -332,7 +332,7 @@ class OpenChemIE:
         figures = [convert_to_pil(figure) for figure in figures]
         return self.moldet.predict_images(figures, batch_size=batch_size)
 
-    def extract_molecules_from_figures(self, figures, batch_size=16):
+    def extract_molecules_from_figures(self, figures, batch_size=16, skip_molblock=False):
         """
         Get all molecules and their information from list of figures
         Parameters:
@@ -377,7 +377,7 @@ class OpenChemIE:
             results, cropped_images, refs = clean_bbox_output(figures, bboxes)
 
         with time_module("molscribe.predict_images", silent=True):
-            mol_info = self.molscribe.predict_images(cropped_images, batch_size=batch_size)
+            mol_info = self.molscribe.predict_images(cropped_images, batch_size=batch_size, skip_molblock=skip_molblock)
 
         # Capture MolScribe's detailed timing
         molscribe_timing = None
@@ -475,7 +475,7 @@ class OpenChemIE:
         figures = [convert_to_pil(figure) for figure in figures]
         return self.coref.predict_images(figures, batch_size=batch_size, coref=True, molscribe = molscribe, ocr = ocr)
 
-    def extract_reactions_from_figures_in_pdf(self, pdf, batch_size=16, num_pages=None, molscribe=True, ocr=True):
+    def extract_reactions_from_figures_in_pdf(self, pdf, batch_size=16, num_pages=None, molscribe=True, ocr=True, skip_molblock=False):
         """
         Get reaction information from figures in pdf
         Parameters:
@@ -533,7 +533,7 @@ class OpenChemIE:
         images = [figure['figure']['image'] for figure in figures]
         results = time_function_call(
             self.extract_reactions_from_figures,
-            images, batch_size, molscribe, ocr,
+            images, batch_size, molscribe, ocr, skip_molblock,
             module_name="extract_reactions_from_figures",
             silent=True
         )
@@ -551,7 +551,7 @@ class OpenChemIE:
 
         return results
 
-    def extract_reactions_from_figures(self, figures, batch_size=16, molscribe=True, ocr=True):
+    def extract_reactions_from_figures(self, figures, batch_size=16, molscribe=True, ocr=True, skip_molblock=False):
         """
         Get reaction information from list of figures
         Parameters:
@@ -606,7 +606,7 @@ class OpenChemIE:
 
         results = []
         with time_module("rxnscribe.predict_images", silent=True):
-            reactions = self.rxnscribe.predict_images(pil_figures, batch_size=batch_size, molscribe=molscribe, ocr=ocr)
+            reactions = self.rxnscribe.predict_images(pil_figures, batch_size=batch_size, molscribe=molscribe, ocr=ocr, skip_molblock=skip_molblock)
 
         # Capture RxnScribe's detailed timing
         rxnscribe_timing = None
@@ -749,7 +749,7 @@ class OpenChemIE:
         results_coref = self.extract_molecule_corefs_from_figures_in_pdf(pdf, num_pages=num_pages)
         return associate_corefs(results, results_coref)
 
-    def extract_reactions_from_figures_and_tables_in_pdf(self, pdf, num_pages=None, batch_size=16, molscribe=True, ocr=True):
+    def extract_reactions_from_figures_and_tables_in_pdf(self, pdf, num_pages=None, batch_size=16, molscribe=True, ocr=True, skip_molblock=False):
         """
         Get reaction information from figures and combine with table information in pdf
         Parameters:
@@ -795,7 +795,7 @@ class OpenChemIE:
         """
         figures = self.extract_figures_from_pdf(pdf, num_pages=num_pages, output_bbox=True)
         images = [figure['figure']['image'] for figure in figures]
-        results = self.extract_reactions_from_figures(images, batch_size=batch_size, molscribe=molscribe, ocr=ocr)
+        results = self.extract_reactions_from_figures(images, batch_size=batch_size, molscribe=molscribe, ocr=ocr, skip_molblock=skip_molblock)
         
         # Reset R-group timing before R-group processing
         reset_rgroup_timing()
