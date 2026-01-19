@@ -29,6 +29,38 @@ def _record_molscribe_timing(name, timing_data):
         reset_rgroup_timing()
     _rgroup_timing.data['molscribe_calls'].append({'name': name, **timing_data})
 
+# =============================================================================
+# R-GROUP BOTTLENECK INSTRUMENTATION
+# Global counters and timers for measuring R-group resolution performance
+# =============================================================================
+import time as time_module
+
+_molscribe_call_count = 0
+_rgroup_stats = {
+    'process_tables': 0,
+    'replace_rgroups': 0,
+    'backout': 0,
+    'molscribe_total': 0
+}
+
+def reset_rgroup_stats():
+    """Reset R-group instrumentation counters and timers."""
+    global _molscribe_call_count, _rgroup_stats
+    _molscribe_call_count = 0
+    _rgroup_stats = {
+        'process_tables': 0,
+        'replace_rgroups': 0,
+        'backout': 0,
+        'molscribe_total': 0
+    }
+
+def get_rgroup_stats():
+    """Get current R-group instrumentation data."""
+    return {
+        'call_count': _molscribe_call_count,
+        'timing': _rgroup_stats.copy()
+    }
+
 BOND_TO_INT = {
     "": 0,
     "single": 1,
@@ -99,6 +131,10 @@ def convert_to_cv2(image):
     return image
 
 def replace_rgroups_in_figure(figures, results, coref_results, molscribe, batch_size=16):
+    # INSTRUMENTATION: Time this function
+    global _rgroup_stats
+    _func_start = time_module.time()
+
     pattern = re.compile('(?P<name>[RXY]\d?)[ ]*=[ ]*(?P<group>\w+)')
     for figure, result, corefs in zip(figures, results, coref_results):
         r_groups = []
@@ -135,9 +171,16 @@ def replace_rgroups_in_figure(figures, results, coref_results, molscribe, batch_
                     'products': reaction['products'][:]
                 }
                 result['reactions'].append(to_add)
+
+    # INSTRUMENTATION: Record timing
+    _rgroup_stats['replace_rgroups'] += time_module.time() - _func_start
     return results
 
 def process_tables(figures, results, molscribe, batch_size=16):
+    # INSTRUMENTATION: Time this function
+    global _rgroup_stats
+    _func_start = time_module.time()
+
     r_group_pattern = re.compile(r'^(\w+-)?(?P<group>[\w-]+)( \(\w+\))?$')
     for figure, result in zip(figures, results):
         result['page'] = figure['page']
@@ -151,6 +194,9 @@ def process_tables(figures, results, molscribe, batch_size=16):
             graphs = get_atoms_and_bonds(figure['figure']['image'], orig_reaction, molscribe, batch_size=batch_size)
             relevant_locs = find_relevant_groups(graphs, content['columns'])
             conditions_to_extend = []
+
+            # PHASE 1: Collect all row R-group variations
+            all_row_data = []
             for row in content['rows']:
                 r_groups = {}
                 expanded_conditions = orig_reaction['conditions'][:]
@@ -159,7 +205,7 @@ def process_tables(figures, results, molscribe, batch_size=16):
                     if col['tag'] != 'alkyl group':
                         expanded_conditions.append({
                             'category': '[Table]',
-                            'text': entry['text'], 
+                            'text': entry['text'],
                             'tag': col['tag'],
                             'header': col['text'],
                         })
@@ -168,18 +214,109 @@ def process_tables(figures, results, molscribe, batch_size=16):
                         if found is not None:
                             r_groups[col['text']] = found.group('group')
                             replaced = True
-                reaction = get_replaced_reaction(orig_reaction, graphs, relevant_locs, r_groups, molscribe)  
-                if replaced:
-                    to_add = {
-                        'reactants': reaction['reactants'][:],
-                        'conditions': expanded_conditions,
-                        'products': reaction['products'][:]
-                    }
-                    result['reactions'].append(to_add)
-                else:
+                all_row_data.append((r_groups, expanded_conditions, replaced))
+
+            # PHASE 2: Generate ALL modified graphs for ALL rows
+            all_modified_graphs = []
+            row_metadata = []  # Track which graphs belong to which row
+
+            for row_idx, (r_groups, expanded_conditions, replaced) in enumerate(all_row_data):
+                if not replaced:
                     conditions_to_extend.append(expanded_conditions)
+                    continue
+
+                # Copy graphs and apply R-group substitutions for this row
+                row_graph_start = len(all_modified_graphs)
+                for graph_idx, graph in enumerate(graphs):
+                    graph_copy = {
+                        'image': graph['image'],
+                        'chartok_coords': {
+                            'coords': graph['chartok_coords']['coords'][:],
+                            'symbols': graph['chartok_coords']['symbols'][:],
+                        },
+                        'edges': graph['edges'][:],
+                        'key': graph['key'],
+                    }
+
+                    # Apply R-group replacements for this row
+                    if graph_idx in relevant_locs:
+                        for atom_name, atom_idx in relevant_locs[graph_idx]:
+                            if atom_name in r_groups:
+                                graph_copy['chartok_coords']['symbols'][atom_idx] = r_groups[atom_name]
+
+                    all_modified_graphs.append(graph_copy)
+
+                # Store metadata for result distribution
+                row_metadata.append({
+                    'row_idx': row_idx,
+                    'graph_start_idx': row_graph_start,
+                    'num_graphs': len(graphs),
+                    'r_groups': r_groups,
+                    'expanded_conditions': expanded_conditions
+                })
+
+            # PHASE 3: Single MolScribe call for ALL rows
+            global _molscribe_call_count, _rgroup_stats
+            if all_modified_graphs:
+                _molscribe_call_count += len(all_modified_graphs)
+                _t0 = time_module.time()
+
+                images = [g['image'] for g in all_modified_graphs]
+                all_outputs = molscribe.convert_graph_to_output(all_modified_graphs, images)
+
+                _rgroup_stats['molscribe_total'] += time_module.time() - _t0
+
+                if hasattr(molscribe, 'get_last_convert_timing'):
+                    timing_data = molscribe.get_last_convert_timing()
+                    if timing_data:
+                        _record_molscribe_timing('process_tables.convert_graph_batched_all_rows', timing_data)
+
+            # PHASE 4: Distribute results back to rows/reactions
+            def append_copy(copy_list, entity):
+                if entity['category'] == '[Mol]':
+                    copy_list.append({k: v for k, v in entity.items()})
+                else:
+                    copy_list.append(entity)
+
+            for meta in row_metadata:
+                # Create reaction copy for this row
+                reaction_copy = {}
+                for k, v in orig_reaction.items():
+                    reaction_copy[k] = []
+                    for entity in v:
+                        if type(entity) == list:
+                            sub_list = []
+                            for e in entity:
+                                append_copy(sub_list, e)
+                            reaction_copy[k].append(sub_list)
+                        else:
+                            append_copy(reaction_copy[k], entity)
+
+                # Get outputs for this row's graphs
+                start_idx = meta['graph_start_idx']
+                row_graphs = all_modified_graphs[start_idx:start_idx + meta['num_graphs']]
+                row_outputs = all_outputs[start_idx:start_idx + meta['num_graphs']]
+
+                # Distribute MolScribe results to molecules
+                for graph, output in zip(row_graphs, row_outputs):
+                    molecule = reaction_copy[graph['key'][0]][graph['key'][1]]
+                    molecule['smiles'] = output['smiles']
+                    molecule['molfile'] = output['molfile']
+
+                # Add expanded reaction to results
+                to_add = {
+                    'reactants': reaction_copy['reactants'][:],
+                    'conditions': meta['expanded_conditions'],
+                    'products': reaction_copy['products'][:]
+                }
+                result['reactions'].append(to_add)
+
+            # Handle non-replaced rows
             orig_reaction['conditions'] = [orig_reaction['conditions']]
             orig_reaction['conditions'].extend(conditions_to_extend)
+
+    # INSTRUMENTATION: Record timing
+    _rgroup_stats['process_tables'] += time_module.time() - _func_start
     return results
 
 
@@ -267,15 +404,31 @@ def get_replaced_reaction(orig_reaction, graphs, relevant_locs, mappings, molscr
             else:
                 append_copy(reaction_copy[k], entity)
 
-    for graph in graph_copy:
-        output = molscribe.convert_graph_to_output([graph], [graph['image']])
+    # BATCHED MOLSCRIBE CALLS: Process all graphs in one batch instead of sequentially
+    # This reduces N sequential calls @ ~6s each to 1-2 batched calls
+    global _molscribe_call_count, _rgroup_stats
+
+    if len(graph_copy) > 0:
+        # INSTRUMENTATION: Count MolScribe calls
+        _molscribe_call_count += len(graph_copy)
+
+        # Time batched MolScribe call
+        _t0 = time_module.time()
+        images = [graph['image'] for graph in graph_copy]
+        outputs = molscribe.convert_graph_to_output(graph_copy, images)
+        _rgroup_stats['molscribe_total'] += time_module.time() - _t0
+
         if hasattr(molscribe, 'get_last_convert_timing'):
             timing_data = molscribe.get_last_convert_timing()
             if timing_data:
-                _record_molscribe_timing('get_replaced_reaction.convert_graph', timing_data)
-        molecule = reaction_copy[graph['key'][0]][graph['key'][1]]
-        molecule['smiles'] = output[0]['smiles']
-        molecule['molfile'] = output[0]['molfile']
+                _record_molscribe_timing('get_replaced_reaction.convert_graph_batched', timing_data)
+
+        # Distribute results back to molecules
+        for graph, output in zip(graph_copy, outputs):
+            molecule = reaction_copy[graph['key'][0]][graph['key'][1]]
+            molecule['smiles'] = output['smiles']
+            molecule['molfile'] = output['molfile']
+
     return reaction_copy
 
 def get_sites(tar, ref, ref_site = False):
