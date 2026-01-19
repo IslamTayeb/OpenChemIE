@@ -41,6 +41,109 @@ class OpenChemIE:
         self._chemner = None
         self._coref = None
 
+        # Bbox-based cross-phase caching for MolScribe results
+        # Cache key: (figure_id, bbox_tuple) -> {'smiles': str, 'molfile': str, ...}
+        self._bbox_cache = {}
+        self._bbox_cache_hits = 0
+        self._bbox_cache_misses = 0
+
+    def _compute_iou(self, bbox1, bbox2):
+        """Compute Intersection over Union for two bboxes (normalized coords)."""
+        x1_1, y1_1, x2_1, y2_1 = bbox1
+        x1_2, y1_2, x2_2, y2_2 = bbox2
+
+        # Intersection
+        x1_i = max(x1_1, x1_2)
+        y1_i = max(y1_1, y1_2)
+        x2_i = min(x2_1, x2_2)
+        y2_i = min(y2_1, y2_2)
+
+        if x2_i <= x1_i or y2_i <= y1_i:
+            return 0.0
+
+        intersection = (x2_i - x1_i) * (y2_i - y1_i)
+        area1 = (x2_1 - x1_1) * (y2_1 - y1_1)
+        area2 = (x2_2 - x1_2) * (y2_2 - y1_2)
+        union = area1 + area2 - intersection
+
+        return intersection / union if union > 0 else 0.0
+
+    def _bbox_to_tuple(self, bbox):
+        """Convert bbox to hashable tuple, rounded for tolerance."""
+        return tuple(round(x, 6) for x in bbox)
+
+    def find_cached_smiles(self, figure_id, bbox, iou_threshold=0.8):
+        """
+        Find cached MolScribe result for a bbox in a figure.
+
+        Args:
+            figure_id: Index of the figure being processed
+            bbox: Bounding box (x1, y1, x2, y2) in normalized coordinates
+            iou_threshold: Minimum IoU to consider a match (default 0.8)
+
+        Returns:
+            Cached prediction dict if found, None otherwise
+        """
+        bbox_tuple = self._bbox_to_tuple(bbox)
+
+        # Try exact match first (fast path)
+        key = (figure_id, bbox_tuple)
+        if key in self._bbox_cache:
+            self._bbox_cache_hits += 1
+            return self._bbox_cache[key]
+
+        # Try IoU matching (for cross-detector matches)
+        for (fid, cached_bbox), prediction in self._bbox_cache.items():
+            if fid == figure_id:
+                iou = self._compute_iou(bbox, cached_bbox)
+                if iou >= iou_threshold:
+                    self._bbox_cache_hits += 1
+                    return prediction
+
+        self._bbox_cache_misses += 1
+        return None
+
+    def cache_smiles(self, figure_id, bbox, prediction):
+        """
+        Cache a MolScribe prediction result.
+
+        Args:
+            figure_id: Index of the figure
+            bbox: Bounding box (x1, y1, x2, y2) in normalized coordinates
+            prediction: Dict with 'smiles', 'molfile', etc.
+        """
+        key = (figure_id, self._bbox_to_tuple(bbox))
+        self._bbox_cache[key] = prediction
+
+    def clear_bbox_cache(self):
+        """
+        Clear the bbox cache. Call between PDFs to limit memory.
+
+        Returns:
+            dict: Cache statistics before clearing
+        """
+        stats = self.get_bbox_cache_stats()
+        self._bbox_cache.clear()
+        self._bbox_cache_hits = 0
+        self._bbox_cache_misses = 0
+        return stats
+
+    def get_bbox_cache_stats(self):
+        """
+        Get bbox cache statistics.
+
+        Returns:
+            dict: Contains 'hits', 'misses', 'size', and 'hit_rate'
+        """
+        total = self._bbox_cache_hits + self._bbox_cache_misses
+        hit_rate = self._bbox_cache_hits / total if total > 0 else 0.0
+        return {
+            'hits': self._bbox_cache_hits,
+            'misses': self._bbox_cache_misses,
+            'size': len(self._bbox_cache),
+            'hit_rate': hit_rate
+        }
+
     @property
     def molscribe(self):
         if self._molscribe is None:
@@ -57,6 +160,29 @@ class OpenChemIE:
         if ckpt_path is None:
             ckpt_path = hf_hub_download("yujieq/MolScribe", "swin_base_char_aux_1m.pth")
         self._molscribe = MolScribe(ckpt_path, device=self.device)
+        # Attach cache methods to molscribe instance
+        self._attach_cache_methods(self._molscribe)
+
+    def _attach_cache_methods(self, molscribe_instance):
+        """
+        Attach bbox cache methods to a MolScribe instance.
+        This enables cross-phase caching when the molscribe is shared.
+        """
+        import types
+        # Bind cache lookup method
+        molscribe_instance.find_cached_smiles = types.MethodType(
+            lambda self, figure_id, bbox, iou_threshold=0.8: self._openchemie_ref.find_cached_smiles(figure_id, bbox, iou_threshold),
+            molscribe_instance
+        )
+        # Bind cache store method
+        molscribe_instance.cache_smiles = types.MethodType(
+            lambda self, figure_id, bbox, prediction: self._openchemie_ref.cache_smiles(figure_id, bbox, prediction),
+            molscribe_instance
+        )
+        # Store reference to OpenChemIE for cache access
+        molscribe_instance._openchemie_ref = self
+        # figure_context will be set by the caller before processing each figure
+        molscribe_instance.figure_context = None
 
 
     @property
@@ -74,7 +200,8 @@ class OpenChemIE:
         """
         if ckpt_path is None:
             ckpt_path = hf_hub_download("yujieq/RxnScribe", "pix2seq_reaction_full.ckpt")
-        self._rxnscribe = RxnScribe(ckpt_path, device=self.device)
+        # Pass shared molscribe for cross-phase caching
+        self._rxnscribe = RxnScribe(ckpt_path, device=self.device, molscribe=self.molscribe)
 
 
     @property
@@ -109,7 +236,8 @@ class OpenChemIE:
         """
         if ckpt_path is None:
             ckpt_path = hf_hub_download("Ozymandias314/MolDetectCkpt", "best_hf.ckpt")
-        self._moldet = MolDetect(ckpt_path, device=self.device)
+        # Pass shared molscribe for cross-phase caching
+        self._moldet = MolDetect(ckpt_path, device=self.device, molscribe=self.molscribe)
 
 
     @property
@@ -127,7 +255,8 @@ class OpenChemIE:
         """
         if ckpt_path is None:
             ckpt_path = hf_hub_download("Ozymandias314/MolDetectCkpt", "coref_best_hf.ckpt")
-        self._coref = MolDetect(ckpt_path, device=self.device, coref=True)
+        # Pass shared molscribe for cross-phase caching
+        self._coref = MolDetect(ckpt_path, device=self.device, coref=True, molscribe=self.molscribe)
 
 
     @property
