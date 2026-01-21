@@ -47,6 +47,9 @@ class OpenChemIE:
         self._bbox_cache_hits = 0
         self._bbox_cache_misses = 0
 
+        # Debug tracking for cache diagnostic
+        self._cache_debug = {'stores': [], 'lookups': [], 'iou_checks': []}
+
     def _compute_iou(self, bbox1, bbox2):
         """Compute Intersection over Union for two bboxes (normalized coords)."""
         x1_1, y1_1, x2_1, y2_1 = bbox1
@@ -86,6 +89,14 @@ class OpenChemIE:
         """
         bbox_tuple = self._bbox_to_tuple(bbox)
 
+        # Debug: log lookup attempt
+        self._cache_debug['lookups'].append({
+            'figure_id': figure_id,
+            'bbox': list(bbox_tuple),
+            'cache_size': len(self._bbox_cache),
+            'cache_figure_ids': list(set(fid for fid, _ in self._bbox_cache.keys()))[:10]
+        })
+
         # Try exact match first (fast path)
         key = (figure_id, bbox_tuple)
         if key in self._bbox_cache:
@@ -96,6 +107,15 @@ class OpenChemIE:
         for (fid, cached_bbox), prediction in self._bbox_cache.items():
             if fid == figure_id:
                 iou = self._compute_iou(bbox, cached_bbox)
+                # Debug: log IoU check
+                self._cache_debug['iou_checks'].append({
+                    'lookup_fid': figure_id,
+                    'cached_fid': fid,
+                    'lookup_bbox': list(bbox_tuple),
+                    'cached_bbox': list(cached_bbox),
+                    'iou': round(iou, 4),
+                    'threshold': iou_threshold
+                })
                 if iou >= iou_threshold:
                     self._bbox_cache_hits += 1
                     return prediction
@@ -112,7 +132,16 @@ class OpenChemIE:
             bbox: Bounding box (x1, y1, x2, y2) in normalized coordinates
             prediction: Dict with 'smiles', 'molfile', etc.
         """
-        key = (figure_id, self._bbox_to_tuple(bbox))
+        bbox_tuple = self._bbox_to_tuple(bbox)
+
+        # Debug: log store operation
+        self._cache_debug['stores'].append({
+            'figure_id': figure_id,
+            'bbox': list(bbox_tuple),
+            'smiles': prediction.get('smiles', '')[:50] if prediction else ''
+        })
+
+        key = (figure_id, bbox_tuple)
         self._bbox_cache[key] = prediction
 
     def clear_bbox_cache(self):
@@ -143,6 +172,14 @@ class OpenChemIE:
             'size': len(self._bbox_cache),
             'hit_rate': hit_rate
         }
+
+    def export_cache_debug(self):
+        """Export debug data for cache analysis."""
+        return self._cache_debug
+
+    def reset_cache_debug(self):
+        """Reset debug data for next PDF."""
+        self._cache_debug = {'stores': [], 'lookups': [], 'iou_checks': []}
 
     @property
     def molscribe(self):
@@ -515,6 +552,19 @@ class OpenChemIE:
 
         for info, ref in zip(mol_info, refs):
             ref.update(info)
+
+        # Populate cache with molecule extraction results for cross-phase reuse
+        # This enables reaction extraction to reuse molecules found during molecule extraction
+        for fig_idx, result in enumerate(results):
+            for mol in result.get('molecules', []):
+                bbox = mol.get('bbox')
+                if bbox and mol.get('smiles'):
+                    self.cache_smiles(fig_idx, bbox, {
+                        'smiles': mol.get('smiles'),
+                        'molfile': mol.get('molfile'),
+                        'atoms': mol.get('atoms'),
+                        'bonds': mol.get('bonds')
+                    })
 
         # Add timing data to results
         timing_data = _get_timing_data()
