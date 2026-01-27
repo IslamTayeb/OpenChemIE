@@ -543,7 +543,7 @@ class OpenChemIE:
             results, cropped_images, refs = clean_bbox_output(figures, bboxes)
 
         with time_module("molscribe.predict_images", silent=True):
-            mol_info = self.molscribe.predict_images(cropped_images, batch_size=batch_size, skip_molblock=skip_molblock)
+            mol_info = self.molscribe.predict_images(cropped_images, batch_size=batch_size, skip_molblock=skip_molblock, return_atoms_bonds=True)
 
         # Capture MolScribe's detailed timing
         molscribe_timing = None

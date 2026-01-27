@@ -701,11 +701,12 @@ def generate_subsets(n):
     backtrack(n - 1, [])
     return sorted(result, key=lambda x: (-len(x), x), reverse=True)
 
-def backout(results, coref_results, molscribe):
+def backout(results, coref_results, molscribe, debug=False):
 
     toreturn = []
 
     if not results or not results[0]['reactions'] or not coref_results:
+        if debug: print("[BACKOUT] Early return: empty results/coref")
         return toreturn
 
     try:
@@ -716,12 +717,30 @@ def backout(results, coref_results, molscribe):
         
         
         if len(products) == 1:
-            if products[0] not in coref_results_dict:
-                print("Warning: No Label Parsed")
-                return
-            product_labels = coref_results_dict[products[0]]
             prod = products[0]
-            label_idx = product_labels[0]
+            if products[0] in coref_results_dict:
+                # Template product found directly in coref - use existing behavior
+                product_labels = coref_results_dict[products[0]]
+                label_idx = product_labels[0]
+            else:
+                # Fallback: template not in coref, try to infer label pattern from resolved products
+                # This handles cases where coref model detected resolved variants but not the template
+                label_idx = None
+                for coref_smiles, labels in coref_results_dict.items():
+                    for label in labels:
+                        # Match patterns like "3a", "2b", "1c" etc.
+                        match = re.search(r'(\d+)[a-zA-Z]', label)
+                        if match:
+                            label_idx = label
+                            if debug:
+                                print(f"[BACKOUT] Inferred label pattern from coref: {label_idx}")
+                            break
+                    if label_idx:
+                        break
+
+                if label_idx is None:
+                    print("Warning: No Label Parsed")
+                    return
             '''
             if len(product_labels) == 1:
                 # get the coreference label of the product molecule
@@ -775,7 +794,12 @@ def backout(results, coref_results, molscribe):
         #prepare the product template and get the associated mapping
 
         prod_mol_to_query, prod_template_mol_query = get_atom_mapping(prod_mol, prod_smiles, r_sites_reversed = r_sites_reversed)
-        
+
+        if debug:
+            print(f"[BACKOUT] r_sites_reversed: {r_sites_reversed}")
+            print(f"[BACKOUT] num_r_groups: {num_r_groups}")
+            print(f"[BACKOUT] prod_template_mol_query: {Chem.MolToSmarts(prod_template_mol_query) if prod_template_mol_query else 'None'}")
+
         reactant_mols = []
         
         
@@ -854,7 +878,9 @@ def backout(results, coref_results, molscribe):
 
         #go through all the molecules in the coreference
 
+        if debug: print(f"[BACKOUT] Before clean_corefs: {len(coref_results_dict)} entries, label_idx='{label_idx}'")
         clean_corefs(coref_results_dict, label_idx)
+        if debug: print(f"[BACKOUT] After clean_corefs: {len(coref_results_dict)} entries")
 
         for other_prod in coref_results_dict:
 
@@ -887,18 +913,26 @@ def backout(results, coref_results, molscribe):
                             
                         
                         for other_prod_mol, parsed in all_other_prod_mols:
-                        
+
                             other_prod_frags = Chem.GetMolFrags(other_prod_mol, asMols = True)
-                            
+
+                            substruct_found = False
                             for other_prod_frag in other_prod_frags:
                                 substructs = other_prod_frag.GetSubstructMatches(prod_template_mol_query, uniquify = False)
-                                
+
                                 if len(substructs)>0:
                                     other_prod_mol = other_prod_frag
+                                    substruct_found = True
                                     break
+
+                            if debug:
+                                other_smiles = Chem.MolToSmiles(other_prod_mol) if other_prod_mol else 'None'
+                                print(f"[BACKOUT] Substructure match for '{parsed}': {substruct_found}, frags={len(other_prod_frags)}")
+
                             r_sites_reversed_new = {prod_mol_to_query[r]: r_sites_reversed[r] for r in r_sites_reversed}
 
                             queries = query_enumeration(prod_template_mol_query, r_sites_reversed_new, num_r_groups)
+                            if debug: print(f"[BACKOUT] Generated {len(queries)} queries for enumeration")
 
                             matched = False
 
@@ -906,11 +940,17 @@ def backout(results, coref_results, molscribe):
                                 if not matched:
                                     try:
                                         matched = get_r_group_frags_and_substitute(other_prod_mol, query, reactant_mols, reactant_information, parsed, toreturn)
-                                    except:
-                                        pass
+                                        if debug and matched: print(f"[BACKOUT] SUCCESS: matched and substituted for '{parsed}'")
+                                    except Exception as e:
+                                        if debug: print(f"[BACKOUT] Inner exception during substitution: {e}")
 
-    except:
-        pass                          
+                            if debug and not matched: print(f"[BACKOUT] FAILED: no match for '{parsed}'")
+
+    except Exception as e:
+        if debug:
+            import traceback
+            print(f"[BACKOUT] OUTER EXCEPTION: {e}")
+            traceback.print_exc()                          
                             
          
     return toreturn
@@ -953,14 +993,21 @@ def associate_corefs(results, results_coref):
     return results
 
 
-def expand_reactions_with_backout(initial_results, results_coref, molscribe): 
+def expand_reactions_with_backout(initial_results, results_coref, molscribe, debug=None):
+    import os
+    if debug is None:
+        debug = os.environ.get('OPENCHEMIE_BACKOUT_DEBUG', '0') == '1'
     idx_pattern = r'^\d+[a-zA-Z]{0,2}$'
     for reactions, result_coref in zip(initial_results, results_coref):
         if not reactions['reactions']:
             continue
         try:
-            backout_results = backout([reactions], [result_coref], molscribe)
-        except Exception:
+            backout_results = backout([reactions], [result_coref], molscribe, debug=debug)
+        except Exception as e:
+            if debug:
+                import traceback
+                print(f"[EXPAND] Exception calling backout: {e}")
+                traceback.print_exc()
             continue
         conditions = reactions['reactions'][0]['conditions']
         idt_to_smiles = {}
