@@ -75,14 +75,14 @@ class OpenChemIE:
         """Convert bbox to hashable tuple, rounded for tolerance."""
         return tuple(round(x, 6) for x in bbox)
 
-    def find_cached_smiles(self, figure_id, bbox, iou_threshold=0.8):
+    def find_cached_smiles(self, figure_id, bbox, iou_threshold=0.5):
         """
         Find cached MolScribe result for a bbox in a figure.
 
         Args:
             figure_id: Index of the figure being processed
             bbox: Bounding box (x1, y1, x2, y2) in normalized coordinates
-            iou_threshold: Minimum IoU to consider a match (default 0.8)
+            iou_threshold: Minimum IoU to consider a match (default 0.5)
 
         Returns:
             Cached prediction dict if found, None otherwise

@@ -565,6 +565,36 @@ def expand_r_group_label_helper(res, coref_smiles_to_graphs, other_prod, molscri
             _record_molscribe_timing('expand_r_group_label.convert_graph', timing_data)
     return Chem.MolFromSmiles(o[0]['smiles'])
 
+
+def _build_r_group_graph(res, coref_smiles_to_graphs, other_prod):
+    """Build a modified graph for R-group expansion (no MolScribe call)."""
+    name = res.group('name')
+    group = res.group('group')
+    atoms = coref_smiles_to_graphs[other_prod]['atoms']
+    bonds = coref_smiles_to_graphs[other_prod]['bonds']
+
+    graph = {
+        'image': None,
+        'chartok_coords': {
+            'coords': [],
+            'symbols': [],
+        },
+        'edges': [],
+        'key': None
+    }
+    for atom in atoms:
+        graph['chartok_coords']['coords'].append((atom['x'], atom['y']))
+        graph['chartok_coords']['symbols'].append(atom['atom_symbol'])
+    graph['edges'] = [[0] * len(atoms) for _ in range(len(atoms))]
+    for bond in bonds:
+        i, j = bond['endpoint_atoms']
+        graph['edges'][i][j] = BOND_TO_INT[bond['bond_type']]
+        graph['edges'][j][i] = BOND_TO_INT[bond['bond_type']]
+    for i, symbol in enumerate(graph['chartok_coords']['symbols']):
+        if symbol[1:-1] == name:
+            graph['chartok_coords']['symbols'][i] = group
+    return graph
+
 def get_r_group_frags_and_substitute(other_prod_mol, query, reactant_mols, reactant_information, parsed, toreturn):
     prod_template_mol_query, r_sites_reversed_new, h_sites, num_r_groups = query
     # we get the substruct matches. note that we set uniquify to false since the order matters for our method
@@ -894,24 +924,41 @@ def backout(results, coref_results, molscribe, debug=False):
                     if other_prod != prod_smiles and other_prod_mol is not None:
 
                         #check if there are R groups to be resolved in the target product
-                        
+
                         all_other_prod_mols = []
-    
+
                         r_group_sub_pattern = re.compile('(?P<name>[RXY]\d?)[ ]*=[ ]*(?P<group>\w+)')
 
+                        # Collect all R-group graphs for batched MolScribe call
+                        batch_graphs = []
+                        batch_parsed_labels = []
                         for parsed_labels in coref_results_dict[other_prod]:
                             res = r_group_sub_pattern.search(parsed_labels)
+                            if res is not None and other_prod in coref_smiles_to_graphs:
+                                graph = _build_r_group_graph(res, coref_smiles_to_graphs, other_prod)
+                                batch_graphs.append(graph)
+                                batch_parsed_labels.append(parsed + parsed_labels)
 
-                            if res is not None:
-                                all_other_prod_mols.append((expand_r_group_label_helper(res, coref_smiles_to_graphs, other_prod, molscribe), parsed + parsed_labels))
-                        
+                        if batch_graphs:
+                            # Single batched MolScribe call for all R-group variants
+                            batch_images = [g['image'] for g in batch_graphs]
+                            outputs = molscribe.convert_graph_to_output(batch_graphs, batch_images)
+                            if hasattr(molscribe, 'get_last_convert_timing'):
+                                timing_data = molscribe.get_last_convert_timing()
+                                if timing_data:
+                                    _record_molscribe_timing('expand_r_group_label.convert_graph_batched', timing_data)
+                            for out, p_label in zip(outputs, batch_parsed_labels):
+                                mol = Chem.MolFromSmiles(out['smiles'])
+                                if mol is not None:
+                                    all_other_prod_mols.append((mol, p_label))
+
                         if len(all_other_prod_mols) == 0:
                             if other_prod_mol is not None:
                                 all_other_prod_mols.append((other_prod_mol, parsed))
 
-                        
-                            
-                        
+
+
+
                         for other_prod_mol, parsed in all_other_prod_mols:
 
                             other_prod_frags = Chem.GetMolFrags(other_prod_mol, asMols = True)
