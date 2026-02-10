@@ -218,7 +218,7 @@ class TableExtractor(object):
             return ret
             
     def get_title_and_footnotes(self, tb_coords):
-    
+
         for page_layout in pdfminer.high_level.extract_pages(self.pdf_file, page_numbers=[self.page]):
             title = (0, 0, 0, 0, '')
             footnote = (0, 0, 0, 0, '')

@@ -5,7 +5,7 @@ import warnings
 from functools import lru_cache
 from concurrent.futures import ThreadPoolExecutor
 import layoutparser as lp
-import pdf2image
+import fitz as _fitz
 from PIL import Image
 from huggingface_hub import hf_hub_download, snapshot_download
 from molscribe import MolScribe
@@ -20,6 +20,21 @@ from .timing import time_function_call, log_phase, log_summary, create_timed_wra
 # This warning appears because checkpointing expects gradients, but during inference
 # we use torch.no_grad() which is correct - we don't need gradients for inference
 warnings.filterwarnings('ignore', message='.*None of the inputs have requires_grad=True.*')
+
+def _pdf_to_images(pdf_path, last_page=None):
+    """Convert PDF pages to PIL images using pymupdf (faster than pdf2image/poppler)."""
+    doc = _fitz.open(pdf_path)
+    pages = []
+    n = last_page if last_page else len(doc)
+    zoom = 200 / 72  # match pdf2image default DPI (200)
+    mat = _fitz.Matrix(zoom, zoom)
+    for i in range(min(n, len(doc))):
+        pix = doc[i].get_pixmap(matrix=mat)
+        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+        pages.append(img)
+    doc.close()
+    return pages
+
 
 class OpenChemIE:
     def __init__(self, device=None):
@@ -367,7 +382,7 @@ class OpenChemIE:
                 # more figures
             ]
         """
-        pages = pdf2image.convert_from_path(pdf, last_page=num_pages)
+        pages = _pdf_to_images(pdf, last_page=num_pages)
 
         table_ext = self.tableextractor
         table_ext.set_pdf_file(pdf)
@@ -407,7 +422,7 @@ class OpenChemIE:
                 # more tables
             ]
         """
-        pages = pdf2image.convert_from_path(pdf, last_page=num_pages)
+        pages = _pdf_to_images(pdf, last_page=num_pages)
 
         table_ext = self.tableextractor
         table_ext.set_pdf_file(pdf)
