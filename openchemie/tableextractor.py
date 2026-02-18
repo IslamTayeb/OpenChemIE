@@ -26,6 +26,7 @@ class TableExtractor(object):
         self.model = None
         self.img = None
         self.output_image = True
+        self._page_layout_cache = {}
         self.tagging = {
             'substance': ['compound', 'salt', 'base', 'solvent', 'CBr4', 'collidine', 'InX3', 'substrate', 'ligand', 'PPh3', 'PdL2', 'Cu', 'compd', 'reagent', 'reagant', 'acid', 'aldehyde', 'amine', 'Ln', 'H2O', 'enzyme', 'cofactor', 'oxidant', 'Pt(COD)Cl2', 'CuBr2', 'additive'],
             'ratio': [':'],
@@ -45,6 +46,8 @@ class TableExtractor(object):
         self.output_image = oi
     
     def set_pdf_file(self, pdf):
+        if pdf != self.pdf_file:
+            self._page_layout_cache = {}
         self.pdf_file = pdf
     
     def set_page_num(self, pn):
@@ -75,6 +78,14 @@ class TableExtractor(object):
         self.blocks.update({'table': table_blocks})
         self.blocks.update({'figure': figure_blocks})
     
+    def _get_page_layout(self, page_num):
+        if page_num not in self._page_layout_cache:
+            for page_layout in pdfminer.high_level.extract_pages(
+                self.pdf_file, page_numbers=[page_num]
+            ):
+                self._page_layout_cache[page_num] = page_layout
+        return self._page_layout_cache[page_num]
+
     # type is what coordinates you want to get. it comes in text, title, list, table, and figure
     def convert_to_pdf_coordinates(self, type):
         # scale coordinates
@@ -96,160 +107,159 @@ class TableExtractor(object):
     
     # input: new_coords is singular table bounding box in pdf coordinates
     def extract_singular_table(self, new_coords):
-        for page_layout in pdfminer.high_level.extract_pages(self.pdf_file, page_numbers=[self.page]):
-            elements = []
-            for element in page_layout:
-                if isinstance(element, pdfminer.layout.LTTextBox):
-                    for e in element._objs:
-                        temp = e.bbox
-                        if temp[0] > min(new_coords[0], new_coords[2]) and temp[0] < max(new_coords[0], new_coords[2]) and temp[1] > min(new_coords[1], new_coords[3]) and temp[1] < max(new_coords[1], new_coords[3]) and temp[2] > min(new_coords[0], new_coords[2]) and temp[2] < max(new_coords[0], new_coords[2]) and temp[3] > min(new_coords[1], new_coords[3]) and temp[3] < max(new_coords[1], new_coords[3]) and isinstance(e, pdfminer.layout.LTTextLineHorizontal):
-                            elements.append([e.bbox[0], e.bbox[1], e.bbox[2], e.bbox[3], e.get_text()])
-                            
-            elements = sorted(elements, key=itemgetter(0))
-            w = sorted(elements, key=itemgetter(3), reverse=True)
-            if len(w) <= 1:
-                continue
+        page_layout = self._get_page_layout(self.page)
+        elements = []
+        for element in page_layout:
+            if isinstance(element, pdfminer.layout.LTTextBox):
+                for e in element._objs:
+                    temp = e.bbox
+                    if temp[0] > min(new_coords[0], new_coords[2]) and temp[0] < max(new_coords[0], new_coords[2]) and temp[1] > min(new_coords[1], new_coords[3]) and temp[1] < max(new_coords[1], new_coords[3]) and temp[2] > min(new_coords[0], new_coords[2]) and temp[2] < max(new_coords[0], new_coords[2]) and temp[3] > min(new_coords[1], new_coords[3]) and temp[3] < max(new_coords[1], new_coords[3]) and isinstance(e, pdfminer.layout.LTTextLineHorizontal):
+                        elements.append([e.bbox[0], e.bbox[1], e.bbox[2], e.bbox[3], e.get_text()])
 
-            ret = {}
-            i = 1
-            g = [w[0]]
+        elements = sorted(elements, key=itemgetter(0))
+        w = sorted(elements, key=itemgetter(3), reverse=True)
+        if len(w) <= 1:
+            return None
 
+        ret = {}
+        i = 1
+        g = [w[0]]
+
+        while i < len(w) and w[i][3] > w[i-1][1]:
+            g.append(w[i])
+            i += 1
+        g = sorted(g, key=itemgetter(0))
+        # check for overlaps
+        for a in range(len(g)-1, 0, -1):
+            if g[a][0] < g[a-1][2]:
+                g[a-1][0] = min(g[a][0], g[a-1][0])
+                g[a-1][1] = min(g[a][1], g[a-1][1])
+                g[a-1][2] = max(g[a][2], g[a-1][2])
+                g[a-1][3] = max(g[a][3], g[a-1][3])
+                g[a-1][4] = g[a-1][4].strip() + " " + g[a][4]
+                g.pop(a)
+
+
+        ret.update({"columns":[]})
+        for t in g:
+            temp_bbox = t[:4]
+
+            column_text = t[4].strip()
+            tag = 'unknown'
+            tagged = False
+            for key in self.tagging.keys():
+                for word in self.tagging[key]:
+                    if word in column_text:
+                        tag = key
+                        tagged = True
+                        break
+                if tagged:
+                    break
+
+            if self.output_bbox:
+                ret["columns"].append({'text':column_text,'tag': tag, 'bbox':temp_bbox})
+            else:
+                ret["columns"].append({'text':column_text,'tag': tag})
+            self.column_header_y = max(t[1], t[3])
+        ret.update({"rows":[]})
+
+        g.insert(0, [0, 0, new_coords[0], 0, ''])
+        g.append([new_coords[2], 0, 0, 0, ''])
+        while i < len(w):
+            group = [w[i]]
+            i += 1
             while i < len(w) and w[i][3] > w[i-1][1]:
-                g.append(w[i])
+                group.append(w[i])
                 i += 1
-            g = sorted(g, key=itemgetter(0))
-            # check for overlaps
-            for a in range(len(g)-1, 0, -1):
-                if g[a][0] < g[a-1][2]:
-                    g[a-1][0] = min(g[a][0], g[a-1][0])
-                    g[a-1][1] = min(g[a][1], g[a-1][1])
-                    g[a-1][2] = max(g[a][2], g[a-1][2])
-                    g[a-1][3] = max(g[a][3], g[a-1][3])
-                    g[a-1][4] = g[a-1][4].strip() + " " + g[a][4]
-                    g.pop(a)
-            
-            
-            ret.update({"columns":[]})
-            for t in g:
+            group = sorted(group, key=itemgetter(0))
+
+            for a in range(len(group)-1, 0, -1):
+                if group[a][0] < group[a-1][2]:
+                    group[a-1][0] = min(group[a][0], group[a-1][0])
+                    group[a-1][1] = min(group[a][1], group[a-1][1])
+                    group[a-1][2] = max(group[a][2], group[a-1][2])
+                    group[a-1][3] = max(group[a][3], group[a-1][3])
+                    group[a-1][4] = group[a-1][4].strip() + " " + group[a][4]
+                    group.pop(a)
+
+            a = 1
+            while a < len(g) - 1:
+                if a > len(group):
+                    group.append([0, 0, 0, 0, '\n'])
+                    a += 1
+                    continue
+                if group[a-1][0] >= g[a-1][2] and group[a-1][2] <= g[a+1][0]:
+                    pass
+                    """
+                    if a < len(group) and group[a][0] >= g[a-1][2] and group[a][2] <= g[a+1][0]:
+                        g.insert(1, [g[0][2], 0, group[a-1][2], 0, ''])
+                        #ret["columns"].insert(0, '')
+                    else:
+                        a += 1
+                        continue
+                    """
+                else: group.insert(a-1, [0, 0, 0, 0, '\n'])
+                a += 1
+
+
+            added_row = []
+            for t in group:
                 temp_bbox = t[:4]
-                
-                column_text = t[4].strip()
+                if self.output_bbox:
+                    added_row.append({'text':t[4].strip(), 'bbox':temp_bbox})
+                else:
+                    added_row.append(t[4].strip())
+            ret["rows"].append(added_row)
+        if ret["rows"] and len(ret["rows"][0]) != len(ret["columns"]):
+            ret["columns"] = ret["rows"][0]
+            ret["rows"] = ret["rows"][1:]
+            for col in ret['columns']:
                 tag = 'unknown'
                 tagged = False
                 for key in self.tagging.keys():
                     for word in self.tagging[key]:
-                        if word in column_text:
+                        if word in col['text']:
                             tag = key
                             tagged = True
                             break
                     if tagged:
                         break
-                
-                if self.output_bbox:
-                    ret["columns"].append({'text':column_text,'tag': tag, 'bbox':temp_bbox})
-                else:
-                    ret["columns"].append({'text':column_text,'tag': tag})
-                self.column_header_y = max(t[1], t[3])
-            ret.update({"rows":[]})
+                col['tag'] = tag
 
-            g.insert(0, [0, 0, new_coords[0], 0, ''])
-            g.append([new_coords[2], 0, 0, 0, ''])
-            while i < len(w):
-                group = [w[i]]
-                i += 1
-                while i < len(w) and w[i][3] > w[i-1][1]:
-                    group.append(w[i])
-                    i += 1
-                group = sorted(group, key=itemgetter(0))
-
-                for a in range(len(group)-1, 0, -1):
-                    if group[a][0] < group[a-1][2]:
-                        group[a-1][0] = min(group[a][0], group[a-1][0])
-                        group[a-1][1] = min(group[a][1], group[a-1][1])
-                        group[a-1][2] = max(group[a][2], group[a-1][2])
-                        group[a-1][3] = max(group[a][3], group[a-1][3])
-                        group[a-1][4] = group[a-1][4].strip() + " " + group[a][4]
-                        group.pop(a)
-                
-                a = 1
-                while a < len(g) - 1:
-                    if a > len(group):
-                        group.append([0, 0, 0, 0, '\n'])
-                        a += 1
-                        continue
-                    if group[a-1][0] >= g[a-1][2] and group[a-1][2] <= g[a+1][0]:
-                        pass
-                        """
-                        if a < len(group) and group[a][0] >= g[a-1][2] and group[a][2] <= g[a+1][0]:
-                            g.insert(1, [g[0][2], 0, group[a-1][2], 0, ''])
-                            #ret["columns"].insert(0, '')
-                        else:
-                            a += 1
-                            continue
-                        """
-                    else: group.insert(a-1, [0, 0, 0, 0, '\n'])
-                    a += 1
-                
-                
-                added_row = []
-                for t in group:
-                    temp_bbox = t[:4]
-                    if self.output_bbox:
-                        added_row.append({'text':t[4].strip(), 'bbox':temp_bbox})
-                    else:
-                        added_row.append(t[4].strip())
-                ret["rows"].append(added_row)
-            if ret["rows"] and len(ret["rows"][0]) != len(ret["columns"]):
-                ret["columns"] = ret["rows"][0]
-                ret["rows"] = ret["rows"][1:]
-                for col in ret['columns']:
-                    tag = 'unknown'
-                    tagged = False
-                    for key in self.tagging.keys():
-                        for word in self.tagging[key]:
-                            if word in col['text']:
-                                tag = key
-                                tagged = True
-                                break
-                        if tagged:
-                            break
-                    col['tag'] = tag
-            
-            return ret
+        return ret
             
     def get_title_and_footnotes(self, tb_coords):
-
-        for page_layout in pdfminer.high_level.extract_pages(self.pdf_file, page_numbers=[self.page]):
-            title = (0, 0, 0, 0, '')
-            footnote = (0, 0, 0, 0, '')
-            title_gap = 30
-            footnote_gap = 30
-            for element in page_layout:
-                if isinstance(element, pdfminer.layout.LTTextBoxHorizontal):
-                    if (element.bbox[0] >= tb_coords[0] and element.bbox[0] <= tb_coords[2]) or (element.bbox[2] >= tb_coords[0] and element.bbox[2] <= tb_coords[2]) or (tb_coords[0] >= element.bbox[0] and tb_coords[0] <= element.bbox[2]) or (tb_coords[2] >= element.bbox[0] and tb_coords[2] <= element.bbox[2]):
-                        #print(element)
-                        if 'Table' in element.get_text():
-                            if abs(element.bbox[1] - tb_coords[3]) < title_gap:
-                                title = tuple(element.bbox) + (element.get_text()[element.get_text().index('Table'):].replace('\n', ' '),)
-                                title_gap = abs(element.bbox[1] - tb_coords[3])
-                        if 'Scheme' in element.get_text():
-                            if abs(element.bbox[1] - tb_coords[3]) < title_gap:
-                                title = tuple(element.bbox) + (element.get_text()[element.get_text().index('Scheme'):].replace('\n', ' '),)
-                                title_gap = abs(element.bbox[1] - tb_coords[3])
-                        if element.bbox[1] >= tb_coords[1] and element.bbox[3] <= tb_coords[3]: continue
-                        #print(element)
-                        temp = ['aA', 'aB', 'aC', 'aD', 'aE', 'aF', 'aG', 'aH', 'aI', 'aJ', 'aK', 'aL', 'aM', 'aN', 'aO', 'aP', 'aQ', 'aR', 'aS', 'aT', 'aU', 'aV', 'aW', 'aX', 'aY', 'aZ', 'a1', 'a2', 'a3', 'a4', 'a5', 'a6', 'a7', 'a8', 'a9', 'a0']
-                        for segment in temp:
-                            if segment in element.get_text():
-                                if abs(element.bbox[3] - tb_coords[1]) < footnote_gap:
-                                    footnote = tuple(element.bbox) + (element.get_text()[element.get_text().index(segment):].replace('\n', ' '),)
-                                    footnote_gap = abs(element.bbox[3] - tb_coords[1])
-                                break
-            self.title_y = min(title[1], title[3])
-            if self.output_bbox:
-                return ({'text': title[4], 'bbox': list(title[:4])}, {'text': footnote[4], 'bbox': list(footnote[:4])})
-            else:
-                return (title[4], footnote[4])
+        page_layout = self._get_page_layout(self.page)
+        title = (0, 0, 0, 0, '')
+        footnote = (0, 0, 0, 0, '')
+        title_gap = 30
+        footnote_gap = 30
+        for element in page_layout:
+            if isinstance(element, pdfminer.layout.LTTextBoxHorizontal):
+                if (element.bbox[0] >= tb_coords[0] and element.bbox[0] <= tb_coords[2]) or (element.bbox[2] >= tb_coords[0] and element.bbox[2] <= tb_coords[2]) or (tb_coords[0] >= element.bbox[0] and tb_coords[0] <= element.bbox[2]) or (tb_coords[2] >= element.bbox[0] and tb_coords[2] <= element.bbox[2]):
+                    #print(element)
+                    if 'Table' in element.get_text():
+                        if abs(element.bbox[1] - tb_coords[3]) < title_gap:
+                            title = tuple(element.bbox) + (element.get_text()[element.get_text().index('Table'):].replace('\n', ' '),)
+                            title_gap = abs(element.bbox[1] - tb_coords[3])
+                    if 'Scheme' in element.get_text():
+                        if abs(element.bbox[1] - tb_coords[3]) < title_gap:
+                            title = tuple(element.bbox) + (element.get_text()[element.get_text().index('Scheme'):].replace('\n', ' '),)
+                            title_gap = abs(element.bbox[1] - tb_coords[3])
+                    if element.bbox[1] >= tb_coords[1] and element.bbox[3] <= tb_coords[3]: continue
+                    #print(element)
+                    temp = ['aA', 'aB', 'aC', 'aD', 'aE', 'aF', 'aG', 'aH', 'aI', 'aJ', 'aK', 'aL', 'aM', 'aN', 'aO', 'aP', 'aQ', 'aR', 'aS', 'aT', 'aU', 'aV', 'aW', 'aX', 'aY', 'aZ', 'a1', 'a2', 'a3', 'a4', 'a5', 'a6', 'a7', 'a8', 'a9', 'a0']
+                    for segment in temp:
+                        if segment in element.get_text():
+                            if abs(element.bbox[3] - tb_coords[1]) < footnote_gap:
+                                footnote = tuple(element.bbox) + (element.get_text()[element.get_text().index(segment):].replace('\n', ' '),)
+                                footnote_gap = abs(element.bbox[3] - tb_coords[1])
+                            break
+        self.title_y = min(title[1], title[3])
+        if self.output_bbox:
+            return ({'text': title[4], 'bbox': list(title[:4])}, {'text': footnote[4], 'bbox': list(footnote[:4])})
+        else:
+            return (title[4], footnote[4])
             
     def extract_table_information(self):
         #self.run_model(page_info) # changed
@@ -325,15 +335,18 @@ class TableExtractor(object):
         for i in range(len(pages)):
             self.set_page_num(i)
             self.run_model(pages[i])
-            table_info = self.extract_table_information()
-            figure_info = self.extract_figure_information()
+            if content != 'figures':
+                table_info = self.extract_table_information()
+            else:
+                table_info = []
+            if content != 'tables':
+                figure_info = self.extract_figure_information()
+            else:
+                figure_info = []
             if content == 'tables':
                 ret += table_info
             elif content == 'figures':
                 ret += figure_info
-                for table in table_info:
-                    if table['figure']['bbox'] != []:
-                        ret.append(table)
             else:
                 ret += table_info
                 ret += figure_info

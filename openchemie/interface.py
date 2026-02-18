@@ -432,6 +432,39 @@ class OpenChemIE:
 
         return table_ext.extract_all_tables_and_figures(pages, self.pdfparser, content='tables')
 
+    def extract_figures_and_tables_from_pdf(self, pdf, num_pages=None, output_bbox=False, output_image=True):
+        """
+        Extract both figures and tables in a single pass, sharing PDF-to-image
+        conversion, LayoutParser inference, and pdfminer page caching.
+
+        Parameters:
+            pdf: path to pdf
+            num_pages: process only first `num_pages` pages, if `None` then process all
+            output_bbox: whether to output bounding boxes for each individual entry of a table
+            output_image: whether to include PIL image for figures. default is True
+
+        Returns:
+            tuple of (figures, tables) where each is a list of dicts in the same
+            format as extract_figures_from_pdf / extract_tables_from_pdf
+        """
+        pages = _pdf_to_images(pdf, last_page=num_pages)
+
+        table_ext = self.tableextractor
+        table_ext.set_pdf_file(pdf)
+        table_ext.set_output_image(output_image)
+        table_ext.set_output_bbox(output_bbox)
+
+        all_results = table_ext.extract_all_tables_and_figures(pages, self.pdfparser, content=None)
+
+        figures = []
+        tables = []
+        for item in all_results:
+            if item.get('table', {}).get('content') is not None:
+                tables.append(item)
+            else:
+                figures.append(item)
+        return figures, tables
+
     def extract_molecules_from_figures_in_pdf(self, pdf, batch_size=16, num_pages=None, skip_molblock=False):
         """
         Get all molecules and their information from a pdf
@@ -909,6 +942,122 @@ class OpenChemIE:
         self.chemrxnextractor.set_pdf_file(pdf)
         self.chemrxnextractor.set_pages(num_pages)
         return self.chemrxnextractor.extract_reactions_from_text()
+
+    def extract_molecules_and_reactions_from_text_in_pdf(self, pdf, batch_size=16, num_pages=None):
+        """
+        Combined text extraction: molecules + reactions from a single PDF parse.
+        Avoids duplicate pdftotext + paragraph splitting.
+
+        Returns:
+            tuple: (molecule_results, reaction_results)
+        """
+        self.chemrxnextractor.set_pdf_file(pdf)
+        self.chemrxnextractor.set_pages(num_pages)
+        text = self.chemrxnextractor.get_paragraphs_from_pdf(num_pages)
+
+        # ChemNER for molecules
+        mol_result = []
+        for data in text:
+            model_inp = []
+            for paragraph in data['paragraphs']:
+                model_inp.append(' '.join(paragraph).replace('\n', ''))
+            output = self.chemner.predict_strings(model_inp, batch_size=batch_size)
+            mol_result.append({
+                'molecules': [{'text': t, 'labels': labels} for t, labels in zip(model_inp, output)],
+                'page': data['page']
+            })
+
+        # ChemRxnExtractor for reactions (reuses already-parsed text)
+        rxn_result = []
+        for data in text:
+            L = [sent for paragraph in data['paragraphs'] for sent in paragraph]
+            reactions = self.chemrxnextractor.get_reactions(L, page_number=data['page'])
+            rxn_result.append(reactions)
+
+        return mol_result, rxn_result
+
+    def preparse_text_from_pdfs(self, pdf_paths, num_pages=None):
+        """
+        Pre-parse text from multiple PDFs. Returns parsed paragraph data
+        that can be fed to mega_batch_text_extraction().
+
+        Args:
+            pdf_paths: List of PDF file paths
+            num_pages: Optional limit on number of pages to process per PDF
+
+        Returns:
+            List of (pdf_idx, text_data) tuples where text_data is the paragraph structure
+        """
+        all_preparsed = []
+        for pdf_idx, pdf_path in enumerate(pdf_paths):
+            self.chemrxnextractor.set_pdf_file(pdf_path)
+            self.chemrxnextractor.set_pages(num_pages)
+            text = self.chemrxnextractor.get_paragraphs_from_pdf(num_pages)
+            all_preparsed.append((pdf_idx, text))
+        return all_preparsed
+
+    def mega_batch_text_extraction(self, preparsed_data, batch_size=16):
+        """
+        Run ChemNER and ChemRxnExtractor on pre-parsed text from multiple PDFs
+        in single mega-batches for maximum GPU utilization.
+
+        Args:
+            preparsed_data: Output from preparse_text_from_pdfs()
+            batch_size: Batch size for ChemNER inference
+
+        Returns:
+            Dict mapping pdf_idx -> (molecule_results, reaction_results)
+        """
+        # Collect all paragraphs across all PDFs for mega-batch ChemNER
+        all_strings = []
+        boundaries = []  # (pdf_idx, page, string_start, string_end)
+
+        for pdf_idx, text_pages in preparsed_data:
+            for data in text_pages:
+                start = len(all_strings)
+                for paragraph in data['paragraphs']:
+                    all_strings.append(' '.join(paragraph).replace('\n', ''))
+                boundaries.append((pdf_idx, data['page'], start, len(all_strings)))
+
+        # Single mega-batch ChemNER call
+        all_ner_output = self.chemner.predict_strings(all_strings, batch_size=batch_size) if all_strings else []
+
+        # Collect all sentences for mega-batch ChemRxnExtractor
+        all_sentences = []
+        rxn_boundaries = []  # (pdf_idx, page, sent_start, sent_end)
+
+        for pdf_idx, text_pages in preparsed_data:
+            for data in text_pages:
+                start = len(all_sentences)
+                for paragraph in data['paragraphs']:
+                    all_sentences.extend(paragraph)
+                rxn_boundaries.append((pdf_idx, data['page'], start, len(all_sentences)))
+
+        # Single mega-batch ChemRxnExtractor call
+        all_rxn_output = self.chemrxnextractor.rxn_extractor.get_reactions(all_sentences) if all_sentences else []
+
+        # Distribute results back to per-PDF structure
+        results = {}
+        # Build molecule results
+        for pdf_idx, page, s_start, s_end in boundaries:
+            if pdf_idx not in results:
+                results[pdf_idx] = ([], [])
+            page_strings = all_strings[s_start:s_end]
+            page_ner = all_ner_output[s_start:s_end]
+            results[pdf_idx][0].append({
+                'molecules': [{'text': t, 'labels': labels} for t, labels in zip(page_strings, page_ner)],
+                'page': page
+            })
+
+        # Build reaction results
+        for pdf_idx, page, sent_start, sent_end in rxn_boundaries:
+            if pdf_idx not in results:
+                results[pdf_idx] = ([], [])
+            page_rxns = all_rxn_output[sent_start:sent_end]
+            ret = [r for r in page_rxns if len(r.get('reactions', [])) != 0]
+            results[pdf_idx][1].append({'page': page, 'reactions': ret})
+
+        return results
 
     def extract_reactions_from_text_in_pdf_combined(self, pdf, num_pages=None):
         """
