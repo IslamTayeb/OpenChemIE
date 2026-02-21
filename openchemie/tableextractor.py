@@ -1,15 +1,12 @@
-import pdf2image
+import time
 import numpy as np
 from PIL import Image
-import matplotlib.pyplot as plt
 import layoutparser as lp
-import cv2
+import fitz
 
-from PyPDF2 import PdfReader, PdfWriter
+from PyPDF2 import PdfReader
 import pandas as pd
 
-import pdfminer.high_level
-import pdfminer.layout
 from operator import itemgetter
 
 # inputs: pdf_file, page #, bounding box (optional) (llur or ullr), output_bbox
@@ -56,65 +53,61 @@ class TableExtractor(object):
     def set_output_bbox(self, ob):
         self.output_bbox = ob
         
-    def run_model(self, page_info):
-        #img = np.asarray(pdf2image.convert_from_path(self.pdf_file, dpi=self.image_dpi)[self.page])
-
-        #model = lp.Detectron2LayoutModel('lp://PubLayNet/mask_rcnn_X_101_32x8d_FPN_3x/config', extra_config=["MODEL.ROI_HEADS.SCORE_THRESH_TEST", 0.5], label_map={0: "Text", 1: "Title", 2: "List", 3:"Table", 4:"Figure"})
-        
-        img = np.asarray(page_info)
-        self.img = img
-        
-        layout_result = self.model.detect(img)
-        
-        text_blocks = lp.Layout([b for b in layout_result if b.type == 'Text'])
-        title_blocks = lp.Layout([b for b in layout_result if b.type == 'Title'])
-        list_blocks = lp.Layout([b for b in layout_result if b.type == 'List'])
-        table_blocks = lp.Layout([b for b in layout_result if b.type == 'Table'])
-        figure_blocks = lp.Layout([b for b in layout_result if b.type == 'Figure'])
-        
-        self.blocks.update({'text': text_blocks})
-        self.blocks.update({'title': title_blocks})
-        self.blocks.update({'list': list_blocks})
-        self.blocks.update({'table': table_blocks})
-        self.blocks.update({'figure': figure_blocks})
-    
-    def _get_page_layout(self, page_num):
+    def _get_page_text(self, page_num):
+        """Return (lines, blocks) with bboxes in PDF coords (bottom-left origin).
+        lines: list of [x0, y0, x1, y1, text] for individual text lines
+        blocks: list of [x0, y0, x1, y1, text] for text blocks
+        """
         if page_num not in self._page_layout_cache:
-            for page_layout in pdfminer.high_level.extract_pages(
-                self.pdf_file, page_numbers=[page_num]
-            ):
-                self._page_layout_cache[page_num] = page_layout
+            doc = fitz.open(self.pdf_file)
+            page = doc[page_num]
+            page_height = page.rect.height
+            lines = []
+            blocks = []
+            for block in page.get_text("dict")["blocks"]:
+                if block["type"] != 0:
+                    continue
+                bb = block["bbox"]
+                block_text = ""
+                for line in block["lines"]:
+                    text = "".join(span["text"] for span in line["spans"])
+                    lb = line["bbox"]
+                    # Convert from top-left origin (pymupdf) to bottom-left origin (PDF)
+                    lines.append([lb[0], page_height - lb[3], lb[2], page_height - lb[1], text])
+                    block_text += text + "\n"
+                blocks.append([bb[0], page_height - bb[3], bb[2], page_height - bb[1], block_text])
+            doc.close()
+            self._page_layout_cache[page_num] = (lines, blocks)
         return self._page_layout_cache[page_num]
 
     # type is what coordinates you want to get. it comes in text, title, list, table, and figure
     def convert_to_pdf_coordinates(self, type):
         # scale coordinates
-        
+
         blocks = self.blocks[type]
         coordinates =  [blocks[a].scale(self.pdf_dpi/self.image_dpi) for a in range(len(blocks))]
-        
-        reader = PdfReader(self.pdf_file)
 
-        writer = PdfWriter()
+        reader = PdfReader(self.pdf_file)
         p = reader.pages[self.page]
         a = p.mediabox.upper_left
         new_coords = []
         for new_block in coordinates:
             new_coords.append((new_block.block.x_1, pd.to_numeric(a[1]) - new_block.block.y_2, new_block.block.x_2, pd.to_numeric(a[1]) - new_block.block.y_1))
-        
+
         return new_coords
     # output: list of bounding boxes for tables but in pdf coordinates
     
     # input: new_coords is singular table bounding box in pdf coordinates
     def extract_singular_table(self, new_coords):
-        page_layout = self._get_page_layout(self.page)
+        lines, _ = self._get_page_text(self.page)
         elements = []
-        for element in page_layout:
-            if isinstance(element, pdfminer.layout.LTTextBox):
-                for e in element._objs:
-                    temp = e.bbox
-                    if temp[0] > min(new_coords[0], new_coords[2]) and temp[0] < max(new_coords[0], new_coords[2]) and temp[1] > min(new_coords[1], new_coords[3]) and temp[1] < max(new_coords[1], new_coords[3]) and temp[2] > min(new_coords[0], new_coords[2]) and temp[2] < max(new_coords[0], new_coords[2]) and temp[3] > min(new_coords[1], new_coords[3]) and temp[3] < max(new_coords[1], new_coords[3]) and isinstance(e, pdfminer.layout.LTTextLineHorizontal):
-                        elements.append([e.bbox[0], e.bbox[1], e.bbox[2], e.bbox[3], e.get_text()])
+        x_min, x_max = min(new_coords[0], new_coords[2]), max(new_coords[0], new_coords[2])
+        y_min, y_max = min(new_coords[1], new_coords[3]), max(new_coords[1], new_coords[3])
+        for line in lines:
+            lx0, ly0, lx1, ly1 = line[:4]
+            if (lx0 > x_min and lx0 < x_max and ly0 > y_min and ly0 < y_max and
+                    lx1 > x_min and lx1 < x_max and ly1 > y_min and ly1 < y_max):
+                elements.append([lx0, ly0, lx1, ly1, line[4]])
 
         elements = sorted(elements, key=itemgetter(0))
         w = sorted(elements, key=itemgetter(3), reverse=True)
@@ -229,32 +222,31 @@ class TableExtractor(object):
         return ret
             
     def get_title_and_footnotes(self, tb_coords):
-        page_layout = self._get_page_layout(self.page)
+        _, blocks = self._get_page_text(self.page)
         title = (0, 0, 0, 0, '')
         footnote = (0, 0, 0, 0, '')
         title_gap = 30
         footnote_gap = 30
-        for element in page_layout:
-            if isinstance(element, pdfminer.layout.LTTextBoxHorizontal):
-                if (element.bbox[0] >= tb_coords[0] and element.bbox[0] <= tb_coords[2]) or (element.bbox[2] >= tb_coords[0] and element.bbox[2] <= tb_coords[2]) or (tb_coords[0] >= element.bbox[0] and tb_coords[0] <= element.bbox[2]) or (tb_coords[2] >= element.bbox[0] and tb_coords[2] <= element.bbox[2]):
-                    #print(element)
-                    if 'Table' in element.get_text():
-                        if abs(element.bbox[1] - tb_coords[3]) < title_gap:
-                            title = tuple(element.bbox) + (element.get_text()[element.get_text().index('Table'):].replace('\n', ' '),)
-                            title_gap = abs(element.bbox[1] - tb_coords[3])
-                    if 'Scheme' in element.get_text():
-                        if abs(element.bbox[1] - tb_coords[3]) < title_gap:
-                            title = tuple(element.bbox) + (element.get_text()[element.get_text().index('Scheme'):].replace('\n', ' '),)
-                            title_gap = abs(element.bbox[1] - tb_coords[3])
-                    if element.bbox[1] >= tb_coords[1] and element.bbox[3] <= tb_coords[3]: continue
-                    #print(element)
-                    temp = ['aA', 'aB', 'aC', 'aD', 'aE', 'aF', 'aG', 'aH', 'aI', 'aJ', 'aK', 'aL', 'aM', 'aN', 'aO', 'aP', 'aQ', 'aR', 'aS', 'aT', 'aU', 'aV', 'aW', 'aX', 'aY', 'aZ', 'a1', 'a2', 'a3', 'a4', 'a5', 'a6', 'a7', 'a8', 'a9', 'a0']
-                    for segment in temp:
-                        if segment in element.get_text():
-                            if abs(element.bbox[3] - tb_coords[1]) < footnote_gap:
-                                footnote = tuple(element.bbox) + (element.get_text()[element.get_text().index(segment):].replace('\n', ' '),)
-                                footnote_gap = abs(element.bbox[3] - tb_coords[1])
-                            break
+        for block in blocks:
+            bx0, by0, bx1, by1, text = block[0], block[1], block[2], block[3], block[4]
+            # Check x-overlap with table coordinates
+            if (bx0 >= tb_coords[0] and bx0 <= tb_coords[2]) or (bx1 >= tb_coords[0] and bx1 <= tb_coords[2]) or (tb_coords[0] >= bx0 and tb_coords[0] <= bx1) or (tb_coords[2] >= bx0 and tb_coords[2] <= bx1):
+                if 'Table' in text:
+                    if abs(by0 - tb_coords[3]) < title_gap:
+                        title = (bx0, by0, bx1, by1, text[text.index('Table'):].replace('\n', ' '))
+                        title_gap = abs(by0 - tb_coords[3])
+                if 'Scheme' in text:
+                    if abs(by0 - tb_coords[3]) < title_gap:
+                        title = (bx0, by0, bx1, by1, text[text.index('Scheme'):].replace('\n', ' '))
+                        title_gap = abs(by0 - tb_coords[3])
+                if by0 >= tb_coords[1] and by1 <= tb_coords[3]: continue
+                temp = ['aA', 'aB', 'aC', 'aD', 'aE', 'aF', 'aG', 'aH', 'aI', 'aJ', 'aK', 'aL', 'aM', 'aN', 'aO', 'aP', 'aQ', 'aR', 'aS', 'aT', 'aU', 'aV', 'aW', 'aX', 'aY', 'aZ', 'a1', 'a2', 'a3', 'a4', 'a5', 'a6', 'a7', 'a8', 'a9', 'a0']
+                for segment in temp:
+                    if segment in text:
+                        if abs(by1 - tb_coords[1]) < footnote_gap:
+                            footnote = (bx0, by0, bx1, by1, text[text.index(segment):].replace('\n', ' '))
+                            footnote_gap = abs(by1 - tb_coords[1])
+                        break
         self.title_y = min(title[1], title[3])
         if self.output_bbox:
             return ({'text': title[4], 'bbox': list(title[:4])}, {'text': footnote[4], 'bbox': list(footnote[:4])})
@@ -262,7 +254,6 @@ class TableExtractor(object):
             return (title[4], footnote[4])
             
     def extract_table_information(self):
-        #self.run_model(page_info) # changed
         table_coordinates = self.blocks['table'] #should return a list of layout objects
         table_coordinates_in_pdf = self.convert_to_pdf_coordinates('table') #should return a list of lists
 
@@ -329,18 +320,120 @@ class TableExtractor(object):
         return ans
             
         
+    def _detect_batched(self, pages, page_indices, pdfparser):
+        """Run LayoutParser on multiple pages in a single batched forward pass.
+
+        Args:
+            pages: List of PIL images
+            page_indices: List of page index for each image
+            pdfparser: LayoutParser EfficientDet model
+
+        Returns:
+            Dict mapping page_index -> Layout result
+        """
+        import torch
+
+        # Preprocess all pages
+        all_inputs = []
+        all_infos = []
+        for page in pages:
+            pil_img = pdfparser.image_loader(np.asarray(page))
+            model_input, image_info = pdfparser.preprocessor.preprocess(pil_img)
+            all_inputs.append(model_input)
+            all_infos.append(image_info)
+
+        # Batched forward pass (chunked to limit GPU memory)
+        chunk_size = 32
+        all_outputs = []
+        for start in range(0, len(all_inputs), chunk_size):
+            end = min(start + chunk_size, len(all_inputs))
+            batch_input = torch.cat(all_inputs[start:end], dim=0)
+            batch_info = {
+                key: torch.cat([info[key] for info in all_infos[start:end]], dim=0)
+                for key in all_infos[0]
+            }
+            with torch.no_grad():
+                chunk_output = pdfparser.model(
+                    batch_input.to(pdfparser.device),
+                    {k: v.to(pdfparser.device) for k, v in batch_info.items()},
+                )
+            all_outputs.append(chunk_output)
+
+        batch_output = torch.cat(all_outputs, dim=0) if len(all_outputs) > 1 else all_outputs[0]
+
+        # Split per-page results
+        results = {}
+        for batch_idx, page_idx in enumerate(page_indices):
+            page_output = batch_output[batch_idx:batch_idx + 1]
+            results[page_idx] = pdfparser.gather_output(page_output)
+        return results
+
     def extract_all_tables_and_figures(self, pages, pdfparser, content=None):
         self.model = pdfparser
+        timing = {
+            'pre_filter': 0,
+            'lp_forward_pass': 0,
+            'page_setup': 0,
+            'layout_classify': 0,
+            'table_parsing': 0,
+            'figure_parsing': 0,
+            'active_pages': 0,
+            'total_pages': len(pages),
+        }
+        total_start = time.perf_counter()
+
+        # Pre-filter: skip pages with no embedded images when only extracting figures
+        t0 = time.perf_counter()
+        skip_pages = set()
+        if content == 'figures':
+            doc = fitz.open(self.pdf_file)
+            for i in range(len(pages)):
+                if not doc[i].get_images():
+                    skip_pages.add(i)
+            doc.close()
+        timing['pre_filter'] = time.perf_counter() - t0
+
+        # Collect active pages and run batched detection
+        active_indices = [i for i in range(len(pages)) if i not in skip_pages]
+        timing['active_pages'] = len(active_indices)
+
+        t0 = time.perf_counter()
+        if active_indices:
+            active_pages = [pages[i] for i in active_indices]
+            batch_results = self._detect_batched(active_pages, active_indices, pdfparser)
+        else:
+            batch_results = {}
+        timing['lp_forward_pass'] = time.perf_counter() - t0
+
         ret = []
-        for i in range(len(pages)):
+        for i in active_indices:
+            t0 = time.perf_counter()
             self.set_page_num(i)
-            self.run_model(pages[i])
+            self.img = np.asarray(pages[i])
+            timing['page_setup'] += time.perf_counter() - t0
+
+            # Set blocks from batched detection results
+            t0 = time.perf_counter()
+            layout_result = batch_results[i]
+            self.blocks = {
+                'text': lp.Layout([b for b in layout_result if b.type == 'Text']),
+                'title': lp.Layout([b for b in layout_result if b.type == 'Title']),
+                'list': lp.Layout([b for b in layout_result if b.type == 'List']),
+                'table': lp.Layout([b for b in layout_result if b.type == 'Table']),
+                'figure': lp.Layout([b for b in layout_result if b.type == 'Figure']),
+            }
+            timing['layout_classify'] += time.perf_counter() - t0
+
             if content != 'figures':
+                t0 = time.perf_counter()
                 table_info = self.extract_table_information()
+                timing['table_parsing'] += time.perf_counter() - t0
             else:
                 table_info = []
             if content != 'tables':
+                t0 = time.perf_counter()
                 figure_info = self.extract_figure_information()
+                timing['figure_parsing'] += time.perf_counter() - t0
             else:
                 figure_info = []
             if content == 'tables':
@@ -350,4 +443,7 @@ class TableExtractor(object):
             else:
                 ret += table_info
                 ret += figure_info
+
+        timing['total'] = time.perf_counter() - total_start
+        self._last_timing = timing
         return ret

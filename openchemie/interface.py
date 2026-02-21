@@ -447,7 +447,10 @@ class OpenChemIE:
             tuple of (figures, tables) where each is a list of dicts in the same
             format as extract_figures_from_pdf / extract_tables_from_pdf
         """
+        import time as _time
+        t_render = _time.perf_counter()
         pages = _pdf_to_images(pdf, last_page=num_pages)
+        render_time = _time.perf_counter() - t_render
 
         table_ext = self.tableextractor
         table_ext.set_pdf_file(pdf)
@@ -455,6 +458,12 @@ class OpenChemIE:
         table_ext.set_output_bbox(output_bbox)
 
         all_results = table_ext.extract_all_tables_and_figures(pages, self.pdfparser, content=None)
+
+        # Expose sub-phase timing from table extractor, include render time
+        timing = getattr(table_ext, '_last_timing', None)
+        if timing is not None:
+            timing['pdf_render'] = render_time
+        self._last_fig_table_timing = timing
 
         figures = []
         tables = []
