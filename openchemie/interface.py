@@ -1,3 +1,4 @@
+import pdftotext  # Must import before torchvision (loaded by albumentations/layoutparser) to avoid libjpeg symbol conflict
 import torch
 import re
 import time
