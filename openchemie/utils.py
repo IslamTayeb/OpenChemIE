@@ -341,7 +341,7 @@ def get_atoms_and_bonds(image, reaction, molscribe, batch_size=16):
                 'key': (key, i)
             }
             results.append(to_add)
-    outputs = molscribe.predict_images(cropped_images, return_atoms_bonds=True, batch_size=batch_size)
+    outputs = molscribe.predict_images(cropped_images, return_atoms_bonds=True, return_confidence=True, batch_size=batch_size)
     if hasattr(molscribe, 'get_last_timing'):
         timing_data = molscribe.get_last_timing()
         if timing_data:

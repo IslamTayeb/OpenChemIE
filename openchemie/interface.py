@@ -601,7 +601,7 @@ class OpenChemIE:
             results, cropped_images, refs = clean_bbox_output(figures, bboxes)
 
         with time_module("molscribe.predict_images", silent=True):
-            mol_info = self.molscribe.predict_images(cropped_images, batch_size=batch_size, skip_molblock=skip_molblock, return_atoms_bonds=True)
+            mol_info = self.molscribe.predict_images(cropped_images, batch_size=batch_size, skip_molblock=skip_molblock, return_atoms_bonds=True, return_confidence=True)
 
         # Capture MolScribe's detailed timing
         molscribe_timing = None
@@ -621,7 +621,8 @@ class OpenChemIE:
                         'smiles': mol.get('smiles'),
                         'molfile': mol.get('molfile'),
                         'atoms': mol.get('atoms'),
-                        'bonds': mol.get('bonds')
+                        'bonds': mol.get('bonds'),
+                        'confidence': mol.get('confidence')
                     })
 
         # Add timing data to results
