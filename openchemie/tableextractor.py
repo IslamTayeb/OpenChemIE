@@ -345,6 +345,7 @@ class TableExtractor(object):
         # Batched forward pass (chunked to limit GPU memory)
         chunk_size = 32
         all_outputs = []
+        device = pdfparser.device
         for start in range(0, len(all_inputs), chunk_size):
             end = min(start + chunk_size, len(all_inputs))
             batch_input = torch.cat(all_inputs[start:end], dim=0)
@@ -354,8 +355,8 @@ class TableExtractor(object):
             }
             with torch.no_grad():
                 chunk_output = pdfparser.model(
-                    batch_input.to(pdfparser.device),
-                    {k: v.to(pdfparser.device) for k, v in batch_info.items()},
+                    batch_input.to(device),
+                    {k: v.to(device) for k, v in batch_info.items()},
                 )
             all_outputs.append(chunk_output)
 
